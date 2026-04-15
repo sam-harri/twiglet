@@ -1,0 +1,57 @@
+[package]
+name = "twiglet_engine"
+version = "0.1.0"
+edition = "2024"
+default-run = "twiglet_engine"
+
+[dependencies]
+axum = { version = "0.8", features = ["macros"] }
+tokio = { version = "1", features = ["full"] }
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+rocksdb = "0.24"
+object_store = { version = "0.13", features = ["aws"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+bincode = "1.3.3"
+bytes = { version = "1", features = ["serde"] }
+blake3 = "1"
+async-trait = "0.1"
+futures = "0.3"
+tokio-util = { version = "0.7", features = ["io"] }
+http-body-util = "0.1"
+base64 = "0.22"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+dashmap = "6"
+rand = "0.10"
+snowflake = { version = "1.2", features = ["serde_support"] }
+hex = "0.4"
+envy = "0.4"
+fastcdc = "3.2.1"
+utoipa = { version = "5", features = ["axum_extras"] }
+utoipa-swagger-ui = { version = "9", features = ["axum"] }
+
+[dev-dependencies]
+tempfile = "3"
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[test]]
+name = "api_scenarios"
+path = "integration/main.rs"
+
+[[bench]]
+name = "write_throughput"
+harness = false
+path = "benchmarks/write_throughput.rs"
+
+[[bench]]
+name = "fork_cost"
+harness = false
+path = "benchmarks/fork_cost.rs"
+
+[[bench]]
+name = "ancestry_depth"
+harness = false
+path = "benchmarks/ancestry_depth.rs"
