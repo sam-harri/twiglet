@@ -25,3 +25,4 @@ skills-lock.json
 .claude/
 data/
 *.csv
+.DS_Store
