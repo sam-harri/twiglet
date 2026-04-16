@@ -13,7 +13,7 @@ Requires Docker and Cargo.
 ./scripts/dev.sh
 ```
 
-This starts MinIO (S3-compatible local storage), exports the required env vars, and runs the engine. MinIO console is at `http://localhost:9001` (credentials: `minioadmin` / `minioadmin`).
+This starts MinIO, exports env vars, and runs the control plane.
 
 All config is with env vars :
 

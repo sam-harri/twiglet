@@ -10,5 +10,8 @@ export TWIGLET_STORAGE_REGION=local
 export TWIGLET_STORAGE_ENDPOINT=http://localhost:9000
 export TWIGLET_STORAGE_ACCESS_KEY_ID=minioadmin
 export TWIGLET_STORAGE_SECRET_ACCESS_KEY=minioadmin
+export TWIGLET_HOST=127.0.0.1
+
+export RUST_LOG=info
 
 cargo run

@@ -29,15 +29,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let config = Config::from_env()?;
 
+    info!(
+        host = %config.host,
+        port = config.port,
+        chunk_store = %config.chunk_store_type,
+        storage_bucket = %config.storage_bucket,
+        rocksdb_path = %config.rocksdb_path,
+        chunk_size_bytes = config.chunk_size_bytes,
+        "loaded config"
+    );
+
+    info!(path = %config.rocksdb_path, "opening RocksDB metadata store");
     let metadata: Arc<dyn MetadataStore> = Arc::new(RocksDbMetadataStore::open(
         &config.rocksdb_path,
         config.block_cache_mb,
         config.rate_limit_mb_sec,
     )?);
+    info!("metadata store ready");
 
+    info!(backend = %config.chunk_store_type, bucket = %config.storage_bucket, "initialising chunk store");
     let chunk_store: Arc<dyn ChunkStore> = match config.chunk_store_type.as_str() {
-        "s3" => Arc::new(S3ChunkStore::from_config(&config)?),
-        "local" => Arc::new(LocalFsChunkStore::new(&config.storage_bucket)),
+        "s3" => {
+            let endpoint = config.storage_endpoint.as_deref().unwrap_or("AWS");
+            info!(endpoint, "using S3 chunk store");
+            Arc::new(S3ChunkStore::from_config(&config)?)
+        }
+        "local" => {
+            info!(path = %config.storage_bucket, "using local filesystem chunk store");
+            Arc::new(LocalFsChunkStore::new(&config.storage_bucket))
+        }
         other => {
             return Err(Error::Internal(format!(
                 "unknown chunk_store_type: {other:?}, expected \"s3\" or \"local\""
@@ -47,6 +67,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let chunker = Arc::new(FixedSizeChunker::new(config.chunk_size_bytes)?);
+    info!(chunk_size_bytes = config.chunk_size_bytes, "chunker ready");
 
     if config.admin_username == "twigletadmin" || config.admin_password == "twigletadmin" {
         warn!(
@@ -59,6 +80,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let resolver = Arc::new(AncestryResolver::new(Arc::clone(&metadata)));
 
     let engine = Arc::new(Engine::new(lsn, chunker, chunk_store, metadata, resolver));
+    info!("engine ready");
 
     let auth_layer = middleware::from_fn_with_state(
         http::auth::BasicAuthConfig {
