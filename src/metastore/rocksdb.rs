@@ -33,7 +33,7 @@ use async_trait::async_trait;
 use base64::{Engine, engine::general_purpose::STANDARD};
 use dashmap::DashSet;
 use rocksdb::{
-    BlockBasedOptions, Cache, ColumnFamily, ColumnFamilyDescriptor, DB, DBCompressionType,
+    BlockBasedOptions, Cache, ColumnFamilyDescriptor, DB, DBCompressionType,
     Direction, IteratorMode, Options, WriteBatch,
 };
 
@@ -52,11 +52,6 @@ const CF_OBJECTS: &str = "objects";
 const CF_SNAPSHOTS: &str = "snapshots";
 const SEP: u8 = 0;
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-/// Concatenate byte slices with SEP (0x00) between segments.
 fn join_keys<'a, I>(parts: I) -> Vec<u8>
 where
     I: IntoIterator<Item = &'a [u8]>,
@@ -71,39 +66,16 @@ where
     out
 }
 
-fn deserialize<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T> {
-    bincode::deserialize(bytes)
-        .map_err(|err| Error::Storage(format!("failed to deserialize value: {err}")))
-}
-
-fn serialize<T: serde::Serialize>(value: &T) -> Result<Vec<u8>> {
-    bincode::serialize(value)
-        .map_err(|err| Error::Storage(format!("failed to serialize value: {err}")))
-}
-
-fn cf_handle<'a>(db: &'a DB, name: &str) -> Result<&'a ColumnFamily> {
-    db.cf_handle(name)
-        .ok_or_else(|| Error::Storage(format!("missing column family: {name}")))
-}
-
-/// Encode a `ProcessUniqueId` as a fixed-length hex string safe for use as a RocksDB
-/// key segment. Hex strings are always 32 chars for the 16-byte bincode output and
-/// never contain the SEP byte (0x00).
-fn node_id_to_key_seg(node_id: ProcessUniqueId) -> Result<Vec<u8>> {
-    let raw = serialize(&node_id)?;
-    Ok(hex::encode(&raw).into_bytes())
-}
-
 /// Build the full key for a branch node record: `project\0hex(node_id)`.
 fn branch_node_key(project: &str, node_id: ProcessUniqueId) -> Result<Vec<u8>> {
-    let seg = node_id_to_key_seg(node_id)?;
+    let seg = hex::encode(bincode::serialize(&node_id)?).into_bytes();
     Ok(join_keys([project.as_bytes(), &seg]))
 }
 
 /// Build the prefix used to scan all object versions for a given node:
 /// `project\0hex(node_id)\0`.
 fn object_node_prefix(project: &str, node_id: ProcessUniqueId) -> Result<Vec<u8>> {
-    let seg = node_id_to_key_seg(node_id)?;
+    let seg = hex::encode(bincode::serialize(&node_id)?).into_bytes();
     let mut prefix = join_keys([project.as_bytes(), &seg]);
     prefix.push(SEP);
     Ok(prefix)
@@ -112,50 +84,38 @@ fn object_node_prefix(project: &str, node_id: ProcessUniqueId) -> Result<Vec<u8>
 /// Build the prefix for a specific object path on a node:
 /// `project\0hex(node_id)\0path\0`.
 fn object_path_prefix(project: &str, node_id: ProcessUniqueId, path: &str) -> Result<Vec<u8>> {
-    let seg = node_id_to_key_seg(node_id)?;
+    let seg = hex::encode(bincode::serialize(&node_id)?).into_bytes();
     let mut prefix = join_keys([project.as_bytes(), &seg, path.as_bytes()]);
     prefix.push(SEP);
     Ok(prefix)
 }
 
-fn parse_object_key(key: &[u8]) -> Result<(String, u64)> {
+fn parse_object_key(key: &[u8]) -> (String, u64) {
     // Key format: project\0hex(node_id)\0path\0inverted_lsn — extract path and LSN from the right.
-    let last_sep = key
-        .iter()
-        .rposition(|b| *b == SEP)
-        .ok_or_else(|| Error::Storage("invalid object key: missing separator".into()))?;
-    let inv_bytes = &key[last_sep + 1..];
-    let path_sep = key[..last_sep]
-        .iter()
-        .rposition(|b| *b == SEP)
-        .ok_or_else(|| Error::Storage("invalid object key: missing path separator".into()))?;
-    let path_bytes = &key[path_sep + 1..last_sep];
-
-    let path = std::str::from_utf8(path_bytes)
-        .map_err(|err| Error::Storage(format!("invalid utf8 in path: {err}")))?
+    // All errors here indicate database corruption — keys are only written by this code.
+    let last_sep = key.iter().rposition(|b| *b == SEP)
+        .expect("object key missing final separator — database corrupted");
+    let path_sep = key[..last_sep].iter().rposition(|b| *b == SEP)
+        .expect("object key missing path separator — database corrupted");
+    let path = std::str::from_utf8(&key[path_sep + 1..last_sep])
+        .expect("object key path is not valid utf8 — database corrupted")
         .to_string();
-    let inverted = std::str::from_utf8(inv_bytes)
-        .map_err(|err| Error::Storage(format!("invalid utf8 in lsn: {err}")))?;
-
-    let stored = inverted
+    let stored = std::str::from_utf8(&key[last_sep + 1..])
+        .expect("object key lsn is not valid utf8 — database corrupted")
         .parse::<u64>()
-        .map_err(|err| Error::Storage(format!("invalid inverted lsn {inverted}: {err}")))?;
-    Ok((path, u64::MAX - stored))
+        .expect("object key lsn is not a valid u64 — database corrupted");
+    (path, u64::MAX - stored)
 }
 
-// ---------------------------------------------------------------------------
-// Synchronous helpers (called inside spawn_blocking)
-// ---------------------------------------------------------------------------
-
 fn get_handle_blocking(db: &DB, project: &str, branch_id: &str) -> Result<Option<BranchHandle>> {
-    let cf = cf_handle(db, CF_BRANCH_HANDLES)?;
+    let cf = db.cf_handle(CF_BRANCH_HANDLES).expect("CF_BRANCH_HANDLES not registered");
     let Some(bytes) = db
         .get_cf(cf, join_keys([project.as_bytes(), branch_id.as_bytes()]))
         .map_err(|err| Error::Storage(format!("failed to get branch handle: {err}")))?
     else {
         return Ok(None);
     };
-    Ok(Some(deserialize(&bytes)?))
+    Ok(Some(bincode::deserialize(&bytes)?))
 }
 
 fn get_node_blocking(
@@ -164,20 +124,18 @@ fn get_node_blocking(
     node_id: ProcessUniqueId,
 ) -> Result<Option<BranchNode>> {
     let key = branch_node_key(project, node_id)?;
-    let cf = cf_handle(db, CF_BRANCH_NODES)?;
+    let cf = db.cf_handle(CF_BRANCH_NODES).expect("CF_BRANCH_NODES not registered");
     let Some(bytes) = db
         .get_cf(cf, &key)
         .map_err(|err| Error::Storage(format!("failed to get branch node: {err}")))?
     else {
         return Ok(None);
     };
-    Ok(Some(deserialize(&bytes)?))
+    Ok(Some(bincode::deserialize(&bytes)?))
 }
 
-/// Scan all handles for a project and return branch_ids of children
-/// (handles whose `parent_branch_id` equals `parent_branch_id` argument).
 fn list_children_blocking(db: &DB, project: &str, parent_branch_id: &str) -> Result<Vec<String>> {
-    let cf = cf_handle(db, CF_BRANCH_HANDLES)?;
+    let cf = db.cf_handle(CF_BRANCH_HANDLES).expect("CF_BRANCH_HANDLES not registered");
     let mut prefix = project.as_bytes().to_vec();
     prefix.push(SEP);
     let mut children = Vec::new();
@@ -188,7 +146,7 @@ fn list_children_blocking(db: &DB, project: &str, parent_branch_id: &str) -> Res
         if !key.starts_with(&prefix) {
             break;
         }
-        let handle: BranchHandle = deserialize(&value)?;
+        let handle: BranchHandle = bincode::deserialize(&value)?;
         if handle.parent_branch_id.as_deref() == Some(parent_branch_id) {
             children.push(handle.branch_id);
         }
@@ -196,10 +154,6 @@ fn list_children_blocking(db: &DB, project: &str, parent_branch_id: &str) -> Res
 
     Ok(children)
 }
-
-// ---------------------------------------------------------------------------
-// MutationLease
-// ---------------------------------------------------------------------------
 
 /// RAII guard that removes a branch ID from the mutation lease set on drop.
 struct MutationLease<'a> {
@@ -212,10 +166,6 @@ impl Drop for MutationLease<'_> {
         self.set.remove(&self.key);
     }
 }
-
-// ---------------------------------------------------------------------------
-// RocksDbMetadataStore
-// ---------------------------------------------------------------------------
 
 pub struct RocksDbMetadataStore {
     db: Arc<DB>,
@@ -275,10 +225,6 @@ impl RocksDbMetadataStore {
     }
 }
 
-// ---------------------------------------------------------------------------
-// MetadataStore impl
-// ---------------------------------------------------------------------------
-
 #[async_trait]
 impl MetadataStore for RocksDbMetadataStore {
     async fn create_project(
@@ -287,15 +233,15 @@ impl MetadataStore for RocksDbMetadataStore {
         root_handle: &BranchHandle,
         root_node: &BranchNode,
     ) -> Result<()> {
-        let project_bytes = serialize(project)?;
-        let handle_bytes = serialize(root_handle)?;
-        let node_bytes = serialize(root_node)?;
+        let project_bytes = bincode::serialize(project)?;
+        let handle_bytes = bincode::serialize(root_handle)?;
+        let node_bytes = bincode::serialize(root_node)?;
         let project_id = project.project_id.clone();
         let branch_id = root_handle.branch_id.clone();
         let node_key = branch_node_key(&project_id, root_node.node_id)?;
         let db = Arc::clone(&self.db);
         tokio::task::spawn_blocking(move || {
-            let cf_projects = cf_handle(&db, CF_PROJECTS)?;
+            let cf_projects = db.cf_handle(CF_PROJECTS).expect("CF_PROJECTS not registered");
             if db
                 .get_cf(cf_projects, project_id.as_bytes())
                 .map_err(|err| Error::Storage(format!("failed to check project existence: {err}")))?
@@ -304,8 +250,8 @@ impl MetadataStore for RocksDbMetadataStore {
                 return Err(Error::ProjectAlreadyExists);
             }
 
-            let cf_handles = cf_handle(&db, CF_BRANCH_HANDLES)?;
-            let cf_nodes = cf_handle(&db, CF_BRANCH_NODES)?;
+            let cf_handles = db.cf_handle(CF_BRANCH_HANDLES).expect("CF_BRANCH_HANDLES not registered");
+            let cf_nodes = db.cf_handle(CF_BRANCH_NODES).expect("CF_BRANCH_NODES not registered");
             let mut batch = WriteBatch::default();
             batch.put_cf(cf_projects, project_id.as_bytes(), project_bytes);
             batch.put_cf(
@@ -318,31 +264,31 @@ impl MetadataStore for RocksDbMetadataStore {
                 .map_err(|err| Error::Storage(format!("failed to create project with root: {err}")))
         })
         .await
-        .map_err(|err| Error::Storage(format!("blocking task join failed: {err}")))?
+        .expect("spawn_blocking panicked")
     }
 
     async fn get_project(&self, project_id: &str) -> Result<Option<Project>> {
         let project_id = project_id.to_string();
         let db = Arc::clone(&self.db);
         tokio::task::spawn_blocking(move || {
-            let cf = cf_handle(&db, CF_PROJECTS)?;
+            let cf = db.cf_handle(CF_PROJECTS).expect("CF_PROJECTS not registered");
             let Some(bytes) = db
                 .get_cf(cf, project_id.as_bytes())
                 .map_err(|err| Error::Storage(format!("failed to get project: {err}")))?
             else {
                 return Ok(None);
             };
-            Ok(Some(deserialize::<Project>(&bytes)?))
+            Ok(Some(bincode::deserialize::<Project>(&bytes)?))
         })
         .await
-        .map_err(|err| Error::Storage(format!("blocking task join failed: {err}")))?
+        .expect("spawn_blocking panicked")
     }
 
     async fn delete_project(&self, project_id: &str) -> Result<()> {
         let project_id = project_id.to_string();
         let db = Arc::clone(&self.db);
         tokio::task::spawn_blocking(move || {
-            let cf = cf_handle(&db, CF_PROJECTS)?;
+            let cf = db.cf_handle(CF_PROJECTS).expect("CF_PROJECTS not registered");
             if db
                 .get_cf(cf, project_id.as_bytes())
                 .map_err(|err| Error::Storage(format!("failed to check project: {err}")))?
@@ -354,7 +300,7 @@ impl MetadataStore for RocksDbMetadataStore {
                 .map_err(|err| Error::Storage(format!("failed to delete project: {err}")))
         })
         .await
-        .map_err(|err| Error::Storage(format!("blocking task join failed: {err}")))?
+        .expect("spawn_blocking panicked")
     }
 
     async fn list_projects(&self, cursor: Option<&str>, limit: usize) -> Result<Page<Project>> {
@@ -363,7 +309,7 @@ impl MetadataStore for RocksDbMetadataStore {
             .transpose()?;
         let db = Arc::clone(&self.db);
         tokio::task::spawn_blocking(move || {
-            let cf = cf_handle(&db, CF_PROJECTS)?;
+            let cf = db.cf_handle(CF_PROJECTS).expect("CF_PROJECTS not registered");
             if let Some(cursor_key) = cursor_key.as_ref()
                 && db
                     .get_cf(cf, cursor_key)
@@ -399,7 +345,7 @@ impl MetadataStore for RocksDbMetadataStore {
                     }
                     break;
                 }
-                items.push(deserialize::<Project>(&value)?);
+                items.push(bincode::deserialize::<Project>(&value)?);
                 last_returned_key = Some(key.to_vec());
             }
 
@@ -410,7 +356,7 @@ impl MetadataStore for RocksDbMetadataStore {
             })
         })
         .await
-        .map_err(|err| Error::Storage(format!("blocking task join failed: {err}")))?
+        .expect("spawn_blocking panicked")
     }
 
     async fn create_branch(
@@ -420,13 +366,13 @@ impl MetadataStore for RocksDbMetadataStore {
         node: &BranchNode,
     ) -> Result<()> {
         let handle_key = join_keys([project.as_bytes(), handle.branch_id.as_bytes()]);
-        let handle_bytes = serialize(handle)?;
+        let handle_bytes = bincode::serialize(handle)?;
         let node_key = branch_node_key(project, node.node_id)?;
-        let node_bytes = serialize(node)?;
+        let node_bytes = bincode::serialize(node)?;
         let db = Arc::clone(&self.db);
         tokio::task::spawn_blocking(move || {
-            let cf_handles = cf_handle(&db, CF_BRANCH_HANDLES)?;
-            let cf_nodes = cf_handle(&db, CF_BRANCH_NODES)?;
+            let cf_handles = db.cf_handle(CF_BRANCH_HANDLES).expect("CF_BRANCH_HANDLES not registered");
+            let cf_nodes = db.cf_handle(CF_BRANCH_NODES).expect("CF_BRANCH_NODES not registered");
             let mut batch = WriteBatch::default();
             batch.put_cf(cf_handles, handle_key, handle_bytes);
             batch.put_cf(cf_nodes, node_key, node_bytes);
@@ -434,7 +380,7 @@ impl MetadataStore for RocksDbMetadataStore {
                 .map_err(|err| Error::Storage(format!("failed to create branch: {err}")))
         })
         .await
-        .map_err(|err| Error::Storage(format!("blocking task join failed: {err}")))?
+        .expect("spawn_blocking panicked")
     }
 
     async fn fork_branch(
@@ -449,16 +395,16 @@ impl MetadataStore for RocksDbMetadataStore {
         let _source_lease = self.try_acquire_lease(source_branch_id)?;
 
         let handle_key = join_keys([project.as_bytes(), new_handle.branch_id.as_bytes()]);
-        let handle_bytes = serialize(new_handle)?;
+        let handle_bytes = bincode::serialize(new_handle)?;
         let node_key = branch_node_key(project, new_node.node_id)?;
-        let node_bytes = serialize(new_node)?;
+        let node_bytes = bincode::serialize(new_node)?;
         let project = project.to_string();
         let source_branch_id = source_branch_id.to_string();
         let db = Arc::clone(&self.db);
         tokio::task::spawn_blocking(move || {
             get_handle_blocking(&db, &project, &source_branch_id)?.ok_or(Error::BranchNotFound)?;
-            let cf_handles = cf_handle(&db, CF_BRANCH_HANDLES)?;
-            let cf_nodes = cf_handle(&db, CF_BRANCH_NODES)?;
+            let cf_handles = db.cf_handle(CF_BRANCH_HANDLES).expect("CF_BRANCH_HANDLES not registered");
+            let cf_nodes = db.cf_handle(CF_BRANCH_NODES).expect("CF_BRANCH_NODES not registered");
             let mut batch = WriteBatch::default();
             batch.put_cf(cf_handles, handle_key, handle_bytes);
             batch.put_cf(cf_nodes, node_key, node_bytes);
@@ -466,7 +412,7 @@ impl MetadataStore for RocksDbMetadataStore {
                 .map_err(|err| Error::Storage(format!("failed to fork branch: {err}")))
         })
         .await
-        .map_err(|err| Error::Storage(format!("blocking task join failed: {err}")))?
+        .expect("spawn_blocking panicked")
     }
 
     async fn get_branch(
@@ -481,16 +427,12 @@ impl MetadataStore for RocksDbMetadataStore {
             let Some(handle) = get_handle_blocking(&db, &project, &branch_id)? else {
                 return Ok(None);
             };
-            let node = get_node_blocking(&db, &project, handle.node_id)?.ok_or_else(|| {
-                Error::Storage(format!(
-                    "branch handle {} points to missing node {:?}",
-                    branch_id, handle.node_id
-                ))
-            })?;
+            let node = get_node_blocking(&db, &project, handle.node_id)?
+                .expect("branch handle points to missing node — database corrupted");
             Ok(Some((handle, node)))
         })
         .await
-        .map_err(|err| Error::Storage(format!("blocking task join failed: {err}")))?
+        .expect("spawn_blocking panicked")
     }
 
     async fn delete_branch(&self, project: &str, branch_id: &str) -> Result<()> {
@@ -507,14 +449,14 @@ impl MetadataStore for RocksDbMetadataStore {
                 return Err(Error::BranchHasChildren);
             }
 
-            let cf = cf_handle(&db, CF_BRANCH_HANDLES)?;
+            let cf = db.cf_handle(CF_BRANCH_HANDLES).expect("CF_BRANCH_HANDLES not registered");
             db.delete_cf(cf, join_keys([project.as_bytes(), branch_id.as_bytes()]))
                 .map_err(|err| Error::Storage(format!("failed to delete branch handle: {err}")))
             // Note: the BranchNode is intentionally left in place — it becomes
             // orphaned and is a candidate for future GC.
         })
         .await
-        .map_err(|err| Error::Storage(format!("blocking task join failed: {err}")))?
+        .expect("spawn_blocking panicked")
     }
 
     async fn list_branches(
@@ -531,7 +473,7 @@ impl MetadataStore for RocksDbMetadataStore {
         let project = project.to_string();
         let db = Arc::clone(&self.db);
         tokio::task::spawn_blocking(move || {
-            let cf_handles = cf_handle(&db, CF_BRANCH_HANDLES)?;
+            let cf_handles = db.cf_handle(CF_BRANCH_HANDLES).expect("CF_BRANCH_HANDLES not registered");
             if let Some(cursor_key) = cursor_key.as_ref() {
                 if !cursor_key.starts_with(&project_prefix) {
                     return Err(Error::InvalidCursor);
@@ -577,13 +519,9 @@ impl MetadataStore for RocksDbMetadataStore {
                     break;
                 }
 
-                let handle: BranchHandle = deserialize(&value)?;
-                let node = get_node_blocking(&db, &project, handle.node_id)?.ok_or_else(|| {
-                    Error::Storage(format!(
-                        "branch handle {} points to missing node",
-                        handle.branch_id
-                    ))
-                })?;
+                let handle: BranchHandle = bincode::deserialize(&value)?;
+                let node = get_node_blocking(&db, &project, handle.node_id)?
+                    .expect("branch handle points to missing node — database corrupted");
                 last_returned_key = Some(key.to_vec());
                 items.push((handle, node));
             }
@@ -595,7 +533,7 @@ impl MetadataStore for RocksDbMetadataStore {
             })
         })
         .await
-        .map_err(|err| Error::Storage(format!("blocking task join failed: {err}")))?
+        .expect("spawn_blocking panicked")
     }
 
     async fn reset_branch_node(
@@ -609,7 +547,7 @@ impl MetadataStore for RocksDbMetadataStore {
 
         let new_node = new_node.clone();
         let node_key = branch_node_key(project, new_node.node_id)?;
-        let node_bytes = serialize(&new_node)?;
+        let node_bytes = bincode::serialize(&new_node)?;
         let handle_key = join_keys([project.as_bytes(), branch_id.as_bytes()]);
         let project = project.to_string();
         let branch_id = branch_id.to_string();
@@ -619,10 +557,10 @@ impl MetadataStore for RocksDbMetadataStore {
                 get_handle_blocking(&db, &project, &branch_id)?.ok_or(Error::BranchNotFound)?;
 
             handle.node_id = new_node.node_id;
-            let handle_bytes = serialize(&handle)?;
+            let handle_bytes = bincode::serialize(&handle)?;
 
-            let cf_handles = cf_handle(&db, CF_BRANCH_HANDLES)?;
-            let cf_nodes = cf_handle(&db, CF_BRANCH_NODES)?;
+            let cf_handles = db.cf_handle(CF_BRANCH_HANDLES).expect("CF_BRANCH_HANDLES not registered");
+            let cf_nodes = db.cf_handle(CF_BRANCH_NODES).expect("CF_BRANCH_NODES not registered");
             let mut batch = WriteBatch::default();
             // Write the new node first, then atomically update the handle pointer.
             batch.put_cf(cf_nodes, node_key, node_bytes);
@@ -632,7 +570,7 @@ impl MetadataStore for RocksDbMetadataStore {
             // Old node remains in CF_BRANCH_NODES, orphaned. Future GC will clean it up.
         })
         .await
-        .map_err(|err| Error::Storage(format!("blocking task join failed: {err}")))?
+        .expect("spawn_blocking panicked")
     }
 
     async fn get_branch_node(
@@ -644,7 +582,7 @@ impl MetadataStore for RocksDbMetadataStore {
         let db = Arc::clone(&self.db);
         tokio::task::spawn_blocking(move || get_node_blocking(&db, &project, node_id))
             .await
-            .map_err(|err| Error::Storage(format!("blocking task join failed: {err}")))?
+            .expect("spawn_blocking panicked")
     }
 
     async fn put_object(
@@ -657,22 +595,22 @@ impl MetadataStore for RocksDbMetadataStore {
     ) -> Result<()> {
         // u64::MAX - lsn, zero-padded to 20 digits — newest version sorts first in lexicographic scans
         let inv = format!("{:020}", u64::MAX - lsn);
-        let node_seg = node_id_to_key_seg(node_id)?;
+        let node_seg = hex::encode(bincode::serialize(&node_id)?).into_bytes();
         let key = join_keys([
             project.as_bytes(),
             &node_seg,
             path.as_bytes(),
             inv.as_bytes(),
         ]);
-        let bytes = serialize(meta)?;
+        let bytes = bincode::serialize(meta)?;
         let db = Arc::clone(&self.db);
         tokio::task::spawn_blocking(move || {
-            let cf = cf_handle(&db, CF_OBJECTS)?;
+            let cf = db.cf_handle(CF_OBJECTS).expect("CF_OBJECTS not registered");
             db.put_cf(cf, key, bytes)
                 .map_err(|err| Error::Storage(format!("failed to put object meta: {err}")))
         })
         .await
-        .map_err(|err| Error::Storage(format!("blocking task join failed: {err}")))?
+        .expect("spawn_blocking panicked")
     }
 
     async fn get_object(
@@ -685,22 +623,22 @@ impl MetadataStore for RocksDbMetadataStore {
         let prefix = object_path_prefix(project, node_id, path)?;
         let db = Arc::clone(&self.db);
         tokio::task::spawn_blocking(move || {
-            let cf = cf_handle(&db, CF_OBJECTS)?;
+            let cf = db.cf_handle(CF_OBJECTS).expect("CF_OBJECTS not registered");
             for entry in db.iterator_cf(cf, IteratorMode::From(&prefix, Direction::Forward)) {
                 let (key, value) =
                     entry.map_err(|err| Error::Storage(format!("object scan failed: {err}")))?;
                 if !key.starts_with(&prefix) {
                     break;
                 }
-                let (_, lsn) = parse_object_key(&key)?;
+                let (_, lsn) = parse_object_key(&key);
                 if max_lsn.is_none_or(|cap| lsn <= cap) {
-                    return Ok(Some((lsn, deserialize(&value)?)));
+                    return Ok(Some((lsn, bincode::deserialize(&value)?)));
                 }
             }
             Ok(None)
         })
         .await
-        .map_err(|err| Error::Storage(format!("blocking task join failed: {err}")))?
+        .expect("spawn_blocking panicked")
     }
 
     async fn list_objects(
@@ -732,7 +670,7 @@ impl MetadataStore for RocksDbMetadataStore {
 
         let db = Arc::clone(&self.db);
         tokio::task::spawn_blocking(move || {
-            let cf = cf_handle(&db, CF_OBJECTS)?;
+            let cf = db.cf_handle(CF_OBJECTS).expect("CF_OBJECTS not registered");
             let start = seek_key.as_deref().unwrap_or(&scan_prefix);
             let mode = IteratorMode::From(start, Direction::Forward);
 
@@ -747,7 +685,7 @@ impl MetadataStore for RocksDbMetadataStore {
                     break;
                 }
 
-                let (path, lsn) = parse_object_key(&key)?;
+                let (path, lsn) = parse_object_key(&key);
                 if max_lsn.is_some_and(|cap| lsn > cap) {
                     continue;
                 }
@@ -756,7 +694,7 @@ impl MetadataStore for RocksDbMetadataStore {
                 }
 
                 seen_path = Some(path.clone());
-                let meta: ObjectMeta = deserialize(&value)?;
+                let meta: ObjectMeta = bincode::deserialize(&value)?;
 
                 if items.len() == limit {
                     return Ok(Page {
@@ -785,7 +723,7 @@ impl MetadataStore for RocksDbMetadataStore {
             })
         })
         .await
-        .map_err(|err| Error::Storage(format!("blocking task join failed: {err}")))?
+        .expect("spawn_blocking panicked")
     }
 
     async fn list_children(&self, project: &str, branch_id: &str) -> Result<Vec<String>> {
@@ -794,7 +732,7 @@ impl MetadataStore for RocksDbMetadataStore {
         let db = Arc::clone(&self.db);
         tokio::task::spawn_blocking(move || list_children_blocking(&db, &project, &branch_id))
             .await
-            .map_err(|err| Error::Storage(format!("blocking task join failed: {err}")))?
+            .expect("spawn_blocking panicked")
     }
 
     async fn bulk_put_objects(
@@ -807,10 +745,10 @@ impl MetadataStore for RocksDbMetadataStore {
         let project = project.to_string();
         let db = Arc::clone(&self.db);
         tokio::task::spawn_blocking(move || {
-            let node_seg = node_id_to_key_seg(target_node_id)?;
-            let cf = cf_handle(&db, CF_OBJECTS)?;
+            let node_seg = hex::encode(bincode::serialize(&target_node_id)?).into_bytes();
+            let cf = db.cf_handle(CF_OBJECTS).expect("CF_OBJECTS not registered");
             let mut batch = WriteBatch::default();
-            for (i, obj) in objects.iter().enumerate() {
+            for (i, obj) in objects.into_iter().enumerate() {
                 let lsn = base_lsn + i as u64;
                 let inv = format!("{:020}", u64::MAX - lsn);
                 let key = join_keys([
@@ -819,20 +757,13 @@ impl MetadataStore for RocksDbMetadataStore {
                     obj.path.as_bytes(),
                     inv.as_bytes(),
                 ]);
-                let meta = ObjectMeta {
-                    chunks: obj.chunks.clone(),
-                    size: obj.size,
-                    content_type: obj.content_type.clone(),
-                    tombstone: obj.tombstone,
-                    created_at: obj.created_at,
-                };
-                batch.put_cf(cf, key, serialize(&meta)?);
+                batch.put_cf(cf, key, bincode::serialize(&ObjectMeta::from(obj))?);
             }
             db.write(batch)
                 .map_err(|err| Error::Storage(format!("bulk_put_objects failed: {err}")))
         })
         .await
-        .map_err(|err| Error::Storage(format!("blocking task join failed: {err}")))?
+        .expect("spawn_blocking panicked")
     }
 
     async fn get_max_lsn(&self, project: &str) -> Result<u64> {
@@ -840,7 +771,7 @@ impl MetadataStore for RocksDbMetadataStore {
         scan_prefix.push(SEP);
         let db = Arc::clone(&self.db);
         tokio::task::spawn_blocking(move || {
-            let cf = cf_handle(&db, CF_OBJECTS)?;
+            let cf = db.cf_handle(CF_OBJECTS).expect("CF_OBJECTS not registered");
             let mut max_lsn: u64 = 0;
             for entry in db.iterator_cf(cf, IteratorMode::From(&scan_prefix, Direction::Forward)) {
                 let (key, _) =
@@ -848,20 +779,20 @@ impl MetadataStore for RocksDbMetadataStore {
                 if !key.starts_with(&scan_prefix) {
                     break;
                 }
-                let (_, lsn) = parse_object_key(&key)?;
+                let (_, lsn) = parse_object_key(&key);
                 max_lsn = max_lsn.max(lsn);
             }
             Ok(max_lsn)
         })
         .await
-        .map_err(|err| Error::Storage(format!("blocking task join failed: {err}")))?
+        .expect("spawn_blocking panicked")
     }
 
     async fn get_max_lsn_for_node(&self, project: &str, node_id: ProcessUniqueId) -> Result<u64> {
         let scan_prefix = object_node_prefix(project, node_id)?;
         let db = Arc::clone(&self.db);
         tokio::task::spawn_blocking(move || {
-            let cf = cf_handle(&db, CF_OBJECTS)?;
+            let cf = db.cf_handle(CF_OBJECTS).expect("CF_OBJECTS not registered");
             let mut max_lsn: u64 = 0;
             for entry in db.iterator_cf(cf, IteratorMode::From(&scan_prefix, Direction::Forward)) {
                 let (key, _) =
@@ -869,13 +800,13 @@ impl MetadataStore for RocksDbMetadataStore {
                 if !key.starts_with(&scan_prefix) {
                     break;
                 }
-                let (_, lsn) = parse_object_key(&key)?;
+                let (_, lsn) = parse_object_key(&key);
                 max_lsn = max_lsn.max(lsn);
             }
             Ok(max_lsn)
         })
         .await
-        .map_err(|err| Error::Storage(format!("blocking task join failed: {err}")))?
+        .expect("spawn_blocking panicked")
     }
 
     async fn create_snapshot(
@@ -889,15 +820,15 @@ impl MetadataStore for RocksDbMetadataStore {
             branch_id.as_bytes(),
             snapshot.snapshot_id.as_bytes(),
         ]);
-        let bytes = serialize(snapshot)?;
+        let bytes = bincode::serialize(snapshot)?;
         let db = Arc::clone(&self.db);
         tokio::task::spawn_blocking(move || {
-            let cf = cf_handle(&db, CF_SNAPSHOTS)?;
+            let cf = db.cf_handle(CF_SNAPSHOTS).expect("CF_SNAPSHOTS not registered");
             db.put_cf(cf, key, bytes)
                 .map_err(|err| Error::Storage(format!("failed to put snapshot: {err}")))
         })
         .await
-        .map_err(|err| Error::Storage(format!("blocking task join failed: {err}")))?
+        .expect("spawn_blocking panicked")
     }
 
     async fn get_snapshot(
@@ -909,17 +840,17 @@ impl MetadataStore for RocksDbMetadataStore {
         let key = join_keys([project.as_bytes(), branch_id.as_bytes(), name.as_bytes()]);
         let db = Arc::clone(&self.db);
         tokio::task::spawn_blocking(move || {
-            let cf = cf_handle(&db, CF_SNAPSHOTS)?;
+            let cf = db.cf_handle(CF_SNAPSHOTS).expect("CF_SNAPSHOTS not registered");
             let Some(bytes) = db
                 .get_cf(cf, &key)
                 .map_err(|err| Error::Storage(format!("failed to get snapshot: {err}")))?
             else {
                 return Ok(None);
             };
-            Ok(Some(deserialize(&bytes)?))
+            Ok(Some(bincode::deserialize(&bytes)?))
         })
         .await
-        .map_err(|err| Error::Storage(format!("blocking task join failed: {err}")))?
+        .expect("spawn_blocking panicked")
     }
 
     async fn list_snapshots(
@@ -937,7 +868,7 @@ impl MetadataStore for RocksDbMetadataStore {
             .transpose()?;
         let db = Arc::clone(&self.db);
         tokio::task::spawn_blocking(move || {
-            let cf = cf_handle(&db, CF_SNAPSHOTS)?;
+            let cf = db.cf_handle(CF_SNAPSHOTS).expect("CF_SNAPSHOTS not registered");
             if let Some(cursor_key) = cursor_key.as_ref() {
                 if !cursor_key.starts_with(&prefix) {
                     return Err(Error::InvalidCursor);
@@ -983,7 +914,7 @@ impl MetadataStore for RocksDbMetadataStore {
                     break;
                 }
 
-                items.push(deserialize(&value)?);
+                items.push(bincode::deserialize(&value)?);
                 last_returned_key = Some(key.to_vec());
             }
 
@@ -994,18 +925,18 @@ impl MetadataStore for RocksDbMetadataStore {
             })
         })
         .await
-        .map_err(|err| Error::Storage(format!("blocking task join failed: {err}")))?
+        .expect("spawn_blocking panicked")
     }
 
     async fn delete_snapshot(&self, project: &str, branch_id: &str, name: &str) -> Result<()> {
         let key = join_keys([project.as_bytes(), branch_id.as_bytes(), name.as_bytes()]);
         let db = Arc::clone(&self.db);
         tokio::task::spawn_blocking(move || {
-            let cf = cf_handle(&db, CF_SNAPSHOTS)?;
+            let cf = db.cf_handle(CF_SNAPSHOTS).expect("CF_SNAPSHOTS not registered");
             db.delete_cf(cf, key)
                 .map_err(|err| Error::Storage(format!("failed to delete snapshot: {err}")))
         })
         .await
-        .map_err(|err| Error::Storage(format!("blocking task join failed: {err}")))?
+        .expect("spawn_blocking panicked")
     }
 }

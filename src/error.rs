@@ -101,6 +101,12 @@ impl Error {
     }
 }
 
+impl From<bincode::Error> for Error {
+    fn from(e: bincode::Error) -> Self {
+        Error::Storage(e.to_string())
+    }
+}
+
 impl IntoResponse for Error {
     fn into_response(self) -> Response {
         let status = self.status_code();
