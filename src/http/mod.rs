@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use axum::{
-    Router,
+    Json, Router,
     routing::{delete, get, post, put},
 };
 use utoipa::OpenApi;
@@ -16,8 +16,13 @@ pub mod openapi;
 pub mod projects;
 pub mod snapshots;
 
+async fn health() -> Json<serde_json::Value> {
+    Json(serde_json::json!({ "status": "ok" }))
+}
+
 pub fn docs_router() -> Router {
     Router::new()
+        .route("/health", get(health))
         .merge(SwaggerUi::new("/swagger-ui").url("/openapi.json", openapi::ApiDoc::openapi()))
 }
 
