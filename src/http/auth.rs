@@ -13,10 +13,21 @@ use axum::{
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 
+use crate::config::AuthConfig;
+
 #[derive(Clone, Debug)]
 pub struct BasicAuthConfig {
     pub username: String,
     pub password: String,
+}
+
+impl From<AuthConfig> for BasicAuthConfig {
+    fn from(config: AuthConfig) -> Self {
+        Self {
+            username: config.username,
+            password: config.password,
+        }
+    }
 }
 
 pub async fn basic_auth(

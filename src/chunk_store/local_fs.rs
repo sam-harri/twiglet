@@ -10,6 +10,7 @@ use rand::{RngExt, distr::Alphanumeric};
 use tokio::fs;
 
 use crate::{
+    config::LocalStorageConfig,
     error::{Error, Result},
     types::ChunkHash,
 };
@@ -18,6 +19,14 @@ use super::{ChunkStore, chunk_key};
 
 pub struct LocalFsChunkStore {
     base_dir: PathBuf,
+}
+
+impl From<LocalStorageConfig> for LocalFsChunkStore {
+    fn from(config: LocalStorageConfig) -> Self {
+        Self {
+            base_dir: PathBuf::from(config.path),
+        }
+    }
 }
 
 impl LocalFsChunkStore {

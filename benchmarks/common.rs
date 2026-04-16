@@ -14,6 +14,7 @@ use twiglet_engine::{
     ancestry_resolver::AncestryResolver,
     chunk_store::{ChunkStore, LocalFsChunkStore},
     chunker::FixedSizeChunker,
+    config::{LocalStorageConfig, RocksDbMetastoreConfig},
     engine::Engine,
     http,
     lsn::LazyAtomicLsnGenerator,
@@ -34,9 +35,16 @@ impl Ctx {
         let chunks_dir = tempfile::tempdir().unwrap();
 
         let metadata: Arc<dyn MetadataStore> = Arc::new(
-            RocksDbMetadataStore::open(rocks_dir.path().to_str().unwrap(), 64, 10).unwrap(),
+            RocksDbMetadataStore::try_from(RocksDbMetastoreConfig {
+                path: rocks_dir.path().to_str().unwrap().to_string(),
+                block_cache_mb: 64,
+                rate_limit_mb_sec: 10,
+            })
+            .unwrap(),
         );
-        let chunk_store: Arc<dyn ChunkStore> = Arc::new(LocalFsChunkStore::new(chunks_dir.path()));
+        let chunk_store: Arc<dyn ChunkStore> = Arc::new(LocalFsChunkStore::from(LocalStorageConfig {
+            path: chunks_dir.path().to_str().unwrap().to_string(),
+        }));
         let chunker = Arc::new(FixedSizeChunker::new(4_194_304).unwrap());
         let lsn = Arc::new(LazyAtomicLsnGenerator::new(Arc::clone(&metadata)));
         let resolver = Arc::new(AncestryResolver::new(Arc::clone(&metadata)));

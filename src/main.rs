@@ -11,7 +11,7 @@ use twiglet_engine::{
     ancestry_resolver::AncestryResolver,
     chunk_store::{ChunkStore, LocalFsChunkStore, S3ChunkStore},
     chunker::FixedSizeChunker,
-    config::Config,
+    config::{AppConfig, ChunkerConfig, MetastoreConfig, StorageConfig},
     engine::Engine,
     error::Error,
     http,
@@ -27,51 +27,47 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .compact()
         .init();
 
-    let config = Config::from_env()?;
+    let config = AppConfig::from_env()?;
 
     info!(
-        host = %config.host,
-        port = config.port,
-        chunk_store = %config.chunk_store_type,
-        storage_bucket = %config.storage_bucket,
-        rocksdb_path = %config.rocksdb_path,
-        chunk_size_bytes = config.chunk_size_bytes,
-        "loaded config"
+        host = %config.server.host,
+        port = config.server.port,
+        "loaded server config"
     );
 
-    info!(path = %config.rocksdb_path, "opening RocksDB metadata store");
-    let metadata: Arc<dyn MetadataStore> = Arc::new(RocksDbMetadataStore::open(
-        &config.rocksdb_path,
-        config.block_cache_mb,
-        config.rate_limit_mb_sec,
-    )?);
+    info!(path = %match &config.metastore {
+        MetastoreConfig::RocksDb(c) => &c.path,
+    }, "opening metadata store");
+    let metadata: Arc<dyn MetadataStore> = match config.metastore {
+        MetastoreConfig::RocksDb(c) => Arc::new(RocksDbMetadataStore::try_from(c)?),
+    };
     info!("metadata store ready");
 
-    info!(backend = %config.chunk_store_type, bucket = %config.storage_bucket, "initialising chunk store");
-    let chunk_store: Arc<dyn ChunkStore> = match config.chunk_store_type.as_str() {
-        "s3" => {
-            let endpoint = config.storage_endpoint.as_deref().unwrap_or("AWS");
-            info!(endpoint, "using S3 chunk store");
-            Arc::new(S3ChunkStore::from_config(&config)?)
+    let chunk_store: Arc<dyn ChunkStore> = match config.storage {
+        StorageConfig::Local(c) => {
+            info!(path = %c.path, "using local filesystem chunk store");
+            Arc::new(LocalFsChunkStore::from(c))
         }
-        "local" => {
-            info!(path = %config.storage_bucket, "using local filesystem chunk store");
-            Arc::new(LocalFsChunkStore::new(&config.storage_bucket))
-        }
-        other => {
-            return Err(Error::Internal(format!(
-                "unknown chunk_store_type: {other:?}, expected \"s3\" or \"local\""
-            ))
-            .into());
+        StorageConfig::S3(c) => {
+            let endpoint = c.endpoint.as_deref().unwrap_or("AWS");
+            info!(endpoint, bucket = %c.bucket, "using S3 chunk store");
+            Arc::new(S3ChunkStore::try_from(c)?)
         }
     };
 
-    let chunker = Arc::new(FixedSizeChunker::new(config.chunk_size_bytes)?);
-    info!(chunk_size_bytes = config.chunk_size_bytes, "chunker ready");
+    let chunker: Arc<dyn twiglet_engine::chunker::Chunker> = match config.chunker {
+        ChunkerConfig::Fixed(c) => {
+            info!(chunk_size_bytes = c.chunk_size_bytes, "using fixed-size chunker");
+            Arc::new(FixedSizeChunker::new(c.chunk_size_bytes)?)
+        }
+        ChunkerConfig::Cdc(_) => {
+            return Err(Error::Internal("CDC chunker is not yet implemented".into()).into());
+        }
+    };
 
-    if config.admin_username == "twigletadmin" || config.admin_password == "twigletadmin" {
+    if config.auth.username == "twigletadmin" || config.auth.password == "twigletadmin" {
         warn!(
-            "using default admin credentials — set TWIGLET_ADMIN_USERNAME and TWIGLET_ADMIN_PASSWORD"
+            "using default admin credentials — set TWIGLET_AUTH__USERNAME and TWIGLET_AUTH__PASSWORD"
         );
     }
 
@@ -83,10 +79,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("engine ready");
 
     let auth_layer = middleware::from_fn_with_state(
-        http::auth::BasicAuthConfig {
-            username: config.admin_username.clone(),
-            password: config.admin_password.clone(),
-        },
+        http::auth::BasicAuthConfig::from(config.auth),
         http::auth::basic_auth,
     );
 
@@ -107,7 +100,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .layer(TraceLayer::new_for_http())
         .layer(cors);
 
-    let addr: SocketAddr = format!("{}:{}", config.host, config.port).parse()?;
+    let addr: SocketAddr = format!("{}:{}", config.server.host, config.server.port).parse()?;
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
 

@@ -7,7 +7,7 @@ use bytes::Bytes;
 use object_store::{ObjectStore, ObjectStoreExt, aws::AmazonS3Builder, path::Path as ObjectPath};
 
 use crate::{
-    config::Config,
+    config::S3StorageConfig,
     error::{Error, Result},
     types::ChunkHash,
 };
@@ -18,24 +18,26 @@ pub struct S3ChunkStore {
     store: Arc<dyn ObjectStore>,
 }
 
-impl S3ChunkStore {
-    pub fn from_config(config: &Config) -> Result<Self> {
-        let mut builder = AmazonS3Builder::new().with_bucket_name(&config.storage_bucket);
+impl TryFrom<S3StorageConfig> for S3ChunkStore {
+    type Error = Error;
 
-        // Required for almost all S3 builders even if unused
-        let region = config.storage_region.as_deref().unwrap_or("us-east-1");
-        builder = builder.with_region(region);
+    fn try_from(config: S3StorageConfig) -> Result<Self> {
+        let mut builder = AmazonS3Builder::new().with_bucket_name(&config.bucket);
 
-        if let Some(endpoint) = &config.storage_endpoint {
+        if let Some(region) = &config.region {
+            builder = builder.with_region(region);
+        }
+
+        if let Some(endpoint) = &config.endpoint {
             builder = builder.with_endpoint(endpoint);
             builder = builder.with_allow_http(true);
         }
 
-        if let Some(access_key) = &config.storage_access_key_id {
+        if let Some(access_key) = &config.access_key_id {
             builder = builder.with_access_key_id(access_key);
         }
 
-        if let Some(secret_key) = &config.storage_secret_access_key {
+        if let Some(secret_key) = &config.secret_access_key {
             builder = builder.with_secret_access_key(secret_key);
         }
 

@@ -28,7 +28,7 @@ dashmap = "6"
 rand = "0.10"
 snowflake = { version = "1.2", features = ["serde_support"] }
 hex = "0.4"
-envy = "0.4"
+figment = { version = "0.10", features = ["env"] }
 fastcdc = "3.2.1"
 utoipa = { version = "5", features = ["axum_extras"] }
 utoipa-swagger-ui = { version = "9", features = ["axum"] }

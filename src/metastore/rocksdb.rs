@@ -38,6 +38,7 @@ use rocksdb::{
 };
 
 use crate::{
+    config::RocksDbMetastoreConfig,
     error::{Error, Result},
     id::ProcessUniqueId,
     types::{BranchHandle, BranchNode, ObjectMeta, Page, Project, SnapshotRecord},
@@ -175,8 +176,16 @@ pub struct RocksDbMetadataStore {
     mutation_leases: DashSet<String>,
 }
 
+impl TryFrom<RocksDbMetastoreConfig> for RocksDbMetadataStore {
+    type Error = Error;
+
+    fn try_from(config: RocksDbMetastoreConfig) -> Result<Self> {
+        Self::open(&config.path, config.block_cache_mb, config.rate_limit_mb_sec)
+    }
+}
+
 impl RocksDbMetadataStore {
-    pub fn open(path: &str, block_cache_mb: usize, rate_limit_mb_sec: usize) -> Result<Self> {
+    fn open(path: &str, block_cache_mb: usize, rate_limit_mb_sec: usize) -> Result<Self> {
         let mut db_opts = Options::default();
         db_opts.create_if_missing(true);
         db_opts.create_missing_column_families(true);
