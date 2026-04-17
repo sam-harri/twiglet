@@ -57,7 +57,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let chunker: Arc<dyn twiglet_engine::chunker::Chunker> = match config.chunker {
         ChunkerConfig::Fixed(c) => {
-            info!(chunk_size_bytes = c.chunk_size_bytes, "using fixed-size chunker");
+            info!(
+                chunk_size_bytes = c.chunk_size_bytes,
+                "using fixed-size chunker"
+            );
             Arc::new(FixedSizeChunker::new(c.chunk_size_bytes)?)
         }
         ChunkerConfig::Cdc(_) => {

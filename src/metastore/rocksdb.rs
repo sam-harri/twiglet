@@ -33,8 +33,8 @@ use async_trait::async_trait;
 use base64::{Engine, engine::general_purpose::STANDARD};
 use dashmap::DashSet;
 use rocksdb::{
-    BlockBasedOptions, Cache, ColumnFamilyDescriptor, DB, DBCompressionType,
-    Direction, IteratorMode, Options, WriteBatch,
+    BlockBasedOptions, Cache, ColumnFamilyDescriptor, DB, DBCompressionType, Direction,
+    IteratorMode, Options, WriteBatch,
 };
 
 use crate::{
@@ -94,9 +94,13 @@ fn object_path_prefix(project: &str, node_id: ProcessUniqueId, path: &str) -> Re
 fn parse_object_key(key: &[u8]) -> (String, u64) {
     // Key format: project\0hex(node_id)\0path\0inverted_lsn — extract path and LSN from the right.
     // All errors here indicate database corruption — keys are only written by this code.
-    let last_sep = key.iter().rposition(|b| *b == SEP)
+    let last_sep = key
+        .iter()
+        .rposition(|b| *b == SEP)
         .expect("object key missing final separator — database corrupted");
-    let path_sep = key[..last_sep].iter().rposition(|b| *b == SEP)
+    let path_sep = key[..last_sep]
+        .iter()
+        .rposition(|b| *b == SEP)
         .expect("object key missing path separator — database corrupted");
     let path = std::str::from_utf8(&key[path_sep + 1..last_sep])
         .expect("object key path is not valid utf8 — database corrupted")
@@ -109,7 +113,9 @@ fn parse_object_key(key: &[u8]) -> (String, u64) {
 }
 
 fn get_handle_blocking(db: &DB, project: &str, branch_id: &str) -> Result<Option<BranchHandle>> {
-    let cf = db.cf_handle(CF_BRANCH_HANDLES).expect("CF_BRANCH_HANDLES not registered");
+    let cf = db
+        .cf_handle(CF_BRANCH_HANDLES)
+        .expect("CF_BRANCH_HANDLES not registered");
     let Some(bytes) = db
         .get_cf(cf, join_keys([project.as_bytes(), branch_id.as_bytes()]))
         .map_err(|err| Error::Storage(format!("failed to get branch handle: {err}")))?
@@ -125,7 +131,9 @@ fn get_node_blocking(
     node_id: ProcessUniqueId,
 ) -> Result<Option<BranchNode>> {
     let key = branch_node_key(project, node_id)?;
-    let cf = db.cf_handle(CF_BRANCH_NODES).expect("CF_BRANCH_NODES not registered");
+    let cf = db
+        .cf_handle(CF_BRANCH_NODES)
+        .expect("CF_BRANCH_NODES not registered");
     let Some(bytes) = db
         .get_cf(cf, &key)
         .map_err(|err| Error::Storage(format!("failed to get branch node: {err}")))?
@@ -136,7 +144,9 @@ fn get_node_blocking(
 }
 
 fn list_children_blocking(db: &DB, project: &str, parent_branch_id: &str) -> Result<Vec<String>> {
-    let cf = db.cf_handle(CF_BRANCH_HANDLES).expect("CF_BRANCH_HANDLES not registered");
+    let cf = db
+        .cf_handle(CF_BRANCH_HANDLES)
+        .expect("CF_BRANCH_HANDLES not registered");
     let mut prefix = project.as_bytes().to_vec();
     prefix.push(SEP);
     let mut children = Vec::new();
@@ -180,7 +190,11 @@ impl TryFrom<RocksDbMetastoreConfig> for RocksDbMetadataStore {
     type Error = Error;
 
     fn try_from(config: RocksDbMetastoreConfig) -> Result<Self> {
-        Self::open(&config.path, config.block_cache_mb, config.rate_limit_mb_sec)
+        Self::open(
+            &config.path,
+            config.block_cache_mb,
+            config.rate_limit_mb_sec,
+        )
     }
 }
 
@@ -250,7 +264,9 @@ impl MetadataStore for RocksDbMetadataStore {
         let node_key = branch_node_key(&project_id, root_node.node_id)?;
         let db = Arc::clone(&self.db);
         tokio::task::spawn_blocking(move || {
-            let cf_projects = db.cf_handle(CF_PROJECTS).expect("CF_PROJECTS not registered");
+            let cf_projects = db
+                .cf_handle(CF_PROJECTS)
+                .expect("CF_PROJECTS not registered");
             if db
                 .get_cf(cf_projects, project_id.as_bytes())
                 .map_err(|err| Error::Storage(format!("failed to check project existence: {err}")))?
@@ -259,8 +275,12 @@ impl MetadataStore for RocksDbMetadataStore {
                 return Err(Error::ProjectAlreadyExists);
             }
 
-            let cf_handles = db.cf_handle(CF_BRANCH_HANDLES).expect("CF_BRANCH_HANDLES not registered");
-            let cf_nodes = db.cf_handle(CF_BRANCH_NODES).expect("CF_BRANCH_NODES not registered");
+            let cf_handles = db
+                .cf_handle(CF_BRANCH_HANDLES)
+                .expect("CF_BRANCH_HANDLES not registered");
+            let cf_nodes = db
+                .cf_handle(CF_BRANCH_NODES)
+                .expect("CF_BRANCH_NODES not registered");
             let mut batch = WriteBatch::default();
             batch.put_cf(cf_projects, project_id.as_bytes(), project_bytes);
             batch.put_cf(
@@ -280,7 +300,9 @@ impl MetadataStore for RocksDbMetadataStore {
         let project_id = project_id.to_string();
         let db = Arc::clone(&self.db);
         tokio::task::spawn_blocking(move || {
-            let cf = db.cf_handle(CF_PROJECTS).expect("CF_PROJECTS not registered");
+            let cf = db
+                .cf_handle(CF_PROJECTS)
+                .expect("CF_PROJECTS not registered");
             let Some(bytes) = db
                 .get_cf(cf, project_id.as_bytes())
                 .map_err(|err| Error::Storage(format!("failed to get project: {err}")))?
@@ -297,7 +319,9 @@ impl MetadataStore for RocksDbMetadataStore {
         let project_id = project_id.to_string();
         let db = Arc::clone(&self.db);
         tokio::task::spawn_blocking(move || {
-            let cf = db.cf_handle(CF_PROJECTS).expect("CF_PROJECTS not registered");
+            let cf = db
+                .cf_handle(CF_PROJECTS)
+                .expect("CF_PROJECTS not registered");
             if db
                 .get_cf(cf, project_id.as_bytes())
                 .map_err(|err| Error::Storage(format!("failed to check project: {err}")))?
@@ -318,7 +342,9 @@ impl MetadataStore for RocksDbMetadataStore {
             .transpose()?;
         let db = Arc::clone(&self.db);
         tokio::task::spawn_blocking(move || {
-            let cf = db.cf_handle(CF_PROJECTS).expect("CF_PROJECTS not registered");
+            let cf = db
+                .cf_handle(CF_PROJECTS)
+                .expect("CF_PROJECTS not registered");
             if let Some(cursor_key) = cursor_key.as_ref()
                 && db
                     .get_cf(cf, cursor_key)
@@ -380,8 +406,12 @@ impl MetadataStore for RocksDbMetadataStore {
         let node_bytes = bincode::serialize(node)?;
         let db = Arc::clone(&self.db);
         tokio::task::spawn_blocking(move || {
-            let cf_handles = db.cf_handle(CF_BRANCH_HANDLES).expect("CF_BRANCH_HANDLES not registered");
-            let cf_nodes = db.cf_handle(CF_BRANCH_NODES).expect("CF_BRANCH_NODES not registered");
+            let cf_handles = db
+                .cf_handle(CF_BRANCH_HANDLES)
+                .expect("CF_BRANCH_HANDLES not registered");
+            let cf_nodes = db
+                .cf_handle(CF_BRANCH_NODES)
+                .expect("CF_BRANCH_NODES not registered");
             let mut batch = WriteBatch::default();
             batch.put_cf(cf_handles, handle_key, handle_bytes);
             batch.put_cf(cf_nodes, node_key, node_bytes);
@@ -412,8 +442,12 @@ impl MetadataStore for RocksDbMetadataStore {
         let db = Arc::clone(&self.db);
         tokio::task::spawn_blocking(move || {
             get_handle_blocking(&db, &project, &source_branch_id)?.ok_or(Error::BranchNotFound)?;
-            let cf_handles = db.cf_handle(CF_BRANCH_HANDLES).expect("CF_BRANCH_HANDLES not registered");
-            let cf_nodes = db.cf_handle(CF_BRANCH_NODES).expect("CF_BRANCH_NODES not registered");
+            let cf_handles = db
+                .cf_handle(CF_BRANCH_HANDLES)
+                .expect("CF_BRANCH_HANDLES not registered");
+            let cf_nodes = db
+                .cf_handle(CF_BRANCH_NODES)
+                .expect("CF_BRANCH_NODES not registered");
             let mut batch = WriteBatch::default();
             batch.put_cf(cf_handles, handle_key, handle_bytes);
             batch.put_cf(cf_nodes, node_key, node_bytes);
@@ -458,7 +492,9 @@ impl MetadataStore for RocksDbMetadataStore {
                 return Err(Error::BranchHasChildren);
             }
 
-            let cf = db.cf_handle(CF_BRANCH_HANDLES).expect("CF_BRANCH_HANDLES not registered");
+            let cf = db
+                .cf_handle(CF_BRANCH_HANDLES)
+                .expect("CF_BRANCH_HANDLES not registered");
             db.delete_cf(cf, join_keys([project.as_bytes(), branch_id.as_bytes()]))
                 .map_err(|err| Error::Storage(format!("failed to delete branch handle: {err}")))
             // Note: the BranchNode is intentionally left in place — it becomes
@@ -482,7 +518,9 @@ impl MetadataStore for RocksDbMetadataStore {
         let project = project.to_string();
         let db = Arc::clone(&self.db);
         tokio::task::spawn_blocking(move || {
-            let cf_handles = db.cf_handle(CF_BRANCH_HANDLES).expect("CF_BRANCH_HANDLES not registered");
+            let cf_handles = db
+                .cf_handle(CF_BRANCH_HANDLES)
+                .expect("CF_BRANCH_HANDLES not registered");
             if let Some(cursor_key) = cursor_key.as_ref() {
                 if !cursor_key.starts_with(&project_prefix) {
                     return Err(Error::InvalidCursor);
@@ -568,8 +606,12 @@ impl MetadataStore for RocksDbMetadataStore {
             handle.node_id = new_node.node_id;
             let handle_bytes = bincode::serialize(&handle)?;
 
-            let cf_handles = db.cf_handle(CF_BRANCH_HANDLES).expect("CF_BRANCH_HANDLES not registered");
-            let cf_nodes = db.cf_handle(CF_BRANCH_NODES).expect("CF_BRANCH_NODES not registered");
+            let cf_handles = db
+                .cf_handle(CF_BRANCH_HANDLES)
+                .expect("CF_BRANCH_HANDLES not registered");
+            let cf_nodes = db
+                .cf_handle(CF_BRANCH_NODES)
+                .expect("CF_BRANCH_NODES not registered");
             let mut batch = WriteBatch::default();
             // Write the new node first, then atomically update the handle pointer.
             batch.put_cf(cf_nodes, node_key, node_bytes);
@@ -832,7 +874,9 @@ impl MetadataStore for RocksDbMetadataStore {
         let bytes = bincode::serialize(snapshot)?;
         let db = Arc::clone(&self.db);
         tokio::task::spawn_blocking(move || {
-            let cf = db.cf_handle(CF_SNAPSHOTS).expect("CF_SNAPSHOTS not registered");
+            let cf = db
+                .cf_handle(CF_SNAPSHOTS)
+                .expect("CF_SNAPSHOTS not registered");
             db.put_cf(cf, key, bytes)
                 .map_err(|err| Error::Storage(format!("failed to put snapshot: {err}")))
         })
@@ -849,7 +893,9 @@ impl MetadataStore for RocksDbMetadataStore {
         let key = join_keys([project.as_bytes(), branch_id.as_bytes(), name.as_bytes()]);
         let db = Arc::clone(&self.db);
         tokio::task::spawn_blocking(move || {
-            let cf = db.cf_handle(CF_SNAPSHOTS).expect("CF_SNAPSHOTS not registered");
+            let cf = db
+                .cf_handle(CF_SNAPSHOTS)
+                .expect("CF_SNAPSHOTS not registered");
             let Some(bytes) = db
                 .get_cf(cf, &key)
                 .map_err(|err| Error::Storage(format!("failed to get snapshot: {err}")))?
@@ -877,7 +923,9 @@ impl MetadataStore for RocksDbMetadataStore {
             .transpose()?;
         let db = Arc::clone(&self.db);
         tokio::task::spawn_blocking(move || {
-            let cf = db.cf_handle(CF_SNAPSHOTS).expect("CF_SNAPSHOTS not registered");
+            let cf = db
+                .cf_handle(CF_SNAPSHOTS)
+                .expect("CF_SNAPSHOTS not registered");
             if let Some(cursor_key) = cursor_key.as_ref() {
                 if !cursor_key.starts_with(&prefix) {
                     return Err(Error::InvalidCursor);
@@ -941,7 +989,9 @@ impl MetadataStore for RocksDbMetadataStore {
         let key = join_keys([project.as_bytes(), branch_id.as_bytes(), name.as_bytes()]);
         let db = Arc::clone(&self.db);
         tokio::task::spawn_blocking(move || {
-            let cf = db.cf_handle(CF_SNAPSHOTS).expect("CF_SNAPSHOTS not registered");
+            let cf = db
+                .cf_handle(CF_SNAPSHOTS)
+                .expect("CF_SNAPSHOTS not registered");
             db.delete_cf(cf, key)
                 .map_err(|err| Error::Storage(format!("failed to delete snapshot: {err}")))
         })

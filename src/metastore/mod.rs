@@ -153,7 +153,7 @@ pub trait MetadataStore: Send + Sync {
 
     /// Return a page of the latest object versions on `node_id`, optionally
     /// filtered by path prefix, capped at `max_lsn`, and starting after
-    /// `start_after`. Only the newest version within the LSN cap is returned. 
+    /// `start_after`. Only the newest version within the LSN cap is returned.
     /// Like get object, does not walk the COW ancestry chain
     async fn list_objects(
         &self,

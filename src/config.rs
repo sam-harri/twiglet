@@ -20,7 +20,6 @@ pub struct AppConfig {
     pub auth: AuthConfig,
 }
 
-
 impl AppConfig {
     pub fn from_env() -> Result<Self> {
         Figment::from(Serialized::defaults(AppConfig::default()))

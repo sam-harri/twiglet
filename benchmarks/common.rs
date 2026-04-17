@@ -42,9 +42,10 @@ impl Ctx {
             })
             .unwrap(),
         );
-        let chunk_store: Arc<dyn ChunkStore> = Arc::new(LocalFsChunkStore::from(LocalStorageConfig {
-            path: chunks_dir.path().to_str().unwrap().to_string(),
-        }));
+        let chunk_store: Arc<dyn ChunkStore> =
+            Arc::new(LocalFsChunkStore::from(LocalStorageConfig {
+                path: chunks_dir.path().to_str().unwrap().to_string(),
+            }));
         let chunker = Arc::new(FixedSizeChunker::new(4_194_304).unwrap());
         let lsn = Arc::new(LazyAtomicLsnGenerator::new(Arc::clone(&metadata)));
         let resolver = Arc::new(AncestryResolver::new(Arc::clone(&metadata)));
