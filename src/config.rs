@@ -35,20 +35,11 @@ pub struct ServerConfig {
     pub port: u16,    // TWIGLET_SERVER__PORT
 }
 
-impl ServerConfig {
-    fn default_host() -> String {
-        "127.0.0.1".into()
-    }
-    fn default_port() -> u16 {
-        8080
-    }
-}
-
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
-            host: Self::default_host(),
-            port: Self::default_port(),
+            host: "127.0.0.1".into(),
+            port: 8080,
         }
     }
 }
@@ -59,20 +50,11 @@ pub struct AuthConfig {
     pub password: String, // TWIGLET_AUTH__PASSWORD
 }
 
-impl AuthConfig {
-    fn default_username() -> String {
-        "twigletadmin".into()
-    }
-    fn default_password() -> String {
-        "twigletadmin".into()
-    }
-}
-
 impl Default for AuthConfig {
     fn default() -> Self {
         Self {
-            username: Self::default_username(),
-            password: Self::default_password(),
+            username: "twigletadmin".into(),
+            password: "twigletadmin".into(),
         }
     }
 }
@@ -96,24 +78,12 @@ pub struct RocksDbMetastoreConfig {
     pub rate_limit_mb_sec: usize, // TWIGLET_METASTORE__RATE_LIMIT_MB_SEC
 }
 
-impl RocksDbMetastoreConfig {
-    fn default_path() -> String {
-        "./data/rocksdb".into()
-    }
-    fn default_block_cache_mb() -> usize {
-        1024
-    }
-    fn default_rate_limit_mb_sec() -> usize {
-        50
-    }
-}
-
 impl Default for RocksDbMetastoreConfig {
     fn default() -> Self {
         Self {
-            path: Self::default_path(),
-            block_cache_mb: Self::default_block_cache_mb(),
-            rate_limit_mb_sec: Self::default_rate_limit_mb_sec(),
+            path: "./data/rocksdb".into(),
+            block_cache_mb: 1024,
+            rate_limit_mb_sec: 50,
         }
     }
 }
@@ -136,16 +106,10 @@ pub struct FixedSizeChunkerConfig {
     pub chunk_size_bytes: usize, // TWIGLET_CHUNKER__CHUNK_SIZE_BYTES
 }
 
-impl FixedSizeChunkerConfig {
-    fn default_chunk_size_bytes() -> usize {
-        8_388_608 // 8 MiB
-    }
-}
-
 impl Default for FixedSizeChunkerConfig {
     fn default() -> Self {
         Self {
-            chunk_size_bytes: Self::default_chunk_size_bytes(),
+            chunk_size_bytes: 8_388_608, // 8 MiB
         }
     }
 }
@@ -175,16 +139,10 @@ pub struct LocalStorageConfig {
     pub path: String, // TWIGLET_STORAGE__PATH
 }
 
-impl LocalStorageConfig {
-    fn default_path() -> String {
-        "twiglet-chunks".into()
-    }
-}
-
 impl Default for LocalStorageConfig {
     fn default() -> Self {
         Self {
-            path: Self::default_path(),
+            path: "twiglet-chunks".into(),
         }
     }
 }
