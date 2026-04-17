@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use object_store::{ObjectStore, ObjectStoreExt, aws::AmazonS3Builder, path::Path as ObjectPath};
+use object_store::{ObjectStore, PutPayload, aws::AmazonS3Builder, path::Path as ObjectPath};
 
 use crate::{
     config::S3StorageConfig,
@@ -60,7 +60,7 @@ impl ChunkStore for S3ChunkStore {
             .store
             .put_opts(
                 &key,
-                data.into(),
+                PutPayload::from(data),
                 object_store::PutOptions {
                     mode: object_store::PutMode::Create,
                     ..Default::default()

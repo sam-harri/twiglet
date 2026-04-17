@@ -20,9 +20,15 @@ use crate::{error::Result, types::ChunkHash};
 
 #[async_trait]
 pub trait ChunkStore: Send + Sync {
+    /// Store a chunk by its content hash.
+    /// Idempotent — if the chunk already exists the call succeeds
+    /// without overwriting it.
     async fn put(&self, hash: &ChunkHash, data: Bytes) -> Result<()>;
+
+    /// Retrieve a chunk by its content hash.
     async fn get(&self, hash: &ChunkHash) -> Result<Bytes>;
-    // I'll add this when I implement the garbage collector
+
+    /// Dead code, only needed when I implement the garbage collector (if ever)
     #[allow(dead_code)]
     async fn delete(&self, hash: &ChunkHash) -> Result<()>;
 }
