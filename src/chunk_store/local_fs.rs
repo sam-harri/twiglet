@@ -1,6 +1,6 @@
 //! Local-filesystem chunk store.
 //!
-//! Mostly useful for development and tests. Writes are atomic (tmp + rename)
+//! Mostly useful for development and tests..
 
 use std::path::{Path, PathBuf};
 
@@ -45,6 +45,7 @@ impl LocalFsChunkStore {
 impl ChunkStore for LocalFsChunkStore {
     async fn put(&self, hash: &ChunkHash, data: Bytes) -> Result<()> {
         let path = self.file_path(hash);
+        // this doesnt prevent any races, just an early exit
         if fs::try_exists(&path)
             .await
             .map_err(|err| Error::ChunkStore(format!("failed to stat chunk: {err}")))?
@@ -52,18 +53,19 @@ impl ChunkStore for LocalFsChunkStore {
             return Ok(());
         }
 
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)
-                .await
-                .map_err(|err| Error::ChunkStore(format!("failed to create dirs: {err}")))?;
-        }
+        let parent = path.parent().expect("chunk path always has a parent");
+        fs::create_dir_all(parent)
+            .await
+            .map_err(|err| Error::ChunkStore(format!("failed to create dirs: {err}")))?;
 
+        // tmp file + atomic rename makes 2 writes to the same chunk race proof
+        // both files would have the same content since they are content-addressed
         let tmp_name: String = rand::rng()
             .sample_iter(&Alphanumeric)
             .take(64)
             .map(char::from)
             .collect();
-        let tmp_path = path.with_extension(format!("tmp-{tmp_name}"));
+        let tmp_path = path.with_file_name(format!("tmp-{tmp_name}"));
         fs::write(&tmp_path, data)
             .await
             .map_err(|err| Error::ChunkStore(format!("failed to write tmp chunk: {err}")))?;
@@ -73,21 +75,6 @@ impl ChunkStore for LocalFsChunkStore {
             Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
                 let _ = fs::remove_file(&tmp_path).await;
                 Ok(())
-            }
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                let path_exists = fs::try_exists(&path).await.map_err(|check_err| {
-                    Error::ChunkStore(format!(
-                        "failed to verify destination after rename miss: {check_err}"
-                    ))
-                })?;
-                let _ = fs::remove_file(&tmp_path).await;
-                if path_exists {
-                    Ok(())
-                } else {
-                    Err(Error::ChunkStore(format!(
-                        "failed to atomically move chunk into place: {err}"
-                    )))
-                }
             }
             Err(err) => {
                 let _ = fs::remove_file(&tmp_path).await;
