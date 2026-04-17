@@ -1,11 +1,10 @@
 //! Per-branch LSN generators.
 //!
-//! Each branch has its own atomic counter seeded from the parent's `fork_lsn` at
-//! creation time. This means:
+//! Each branch has its own atomic counter seeded from its parent's `fork_lsn` at
+//! creation time. 
 //!
-//! - concurrent writes to different branches never contend on the same atomic
-//! - because child counters are seeded from the parent's current LSN at fork time , all
-//!   possible ancestry traversals are strictly monotonically decreasing (like going from head to root)
+//! Because child counters are seeded from the parent's current LSN at fork time , all
+//! possible ancestry traversals are strictly monotonically decreasing from head to root
 //!
 //! On the first access for a branch, `LazyAtomicLsnGenerator` gets the current node, then finds the highest LSN
 //! already written on that node.
@@ -21,8 +20,14 @@ use crate::metastore::MetadataStore;
 
 #[async_trait]
 pub trait LsnGenerator: Send + Sync {
+    /// Atomically increment the branch's LSN counter and return the new value.
     async fn next(&self, project_id: &str, branch_id: &str) -> Result<u64>;
+
+    /// Return the current LSN without advancing the counter.
     async fn current(&self, project_id: &str, branch_id: &str) -> Result<u64>;
+
+    /// Atomically reserve a block of `n` LSNs and return the first one.
+    /// Caller exclusively owns `[first, first + n - 1]`.
     async fn next_n(&self, project_id: &str, branch_id: &str, n: u64) -> Result<u64>;
 }
 
@@ -38,11 +43,17 @@ impl LsnCounters {
         }
     }
 
+    /// Seed the counter for `branch_id` to at least `value`.
+    ///
+    /// Safe to call concurrently since `entry()` holds the DashMap shard lock for the
+    /// entire chain, so two racing seeds are serialized, and `fetch_max` means
+    /// the counter ends up at the higher of the two observed values. The worst
+    /// outcome of a concurrent double-seed is one redundant metadata read.
     fn seed(&self, branch_id: &str, value: u64) {
         self.counters
             .entry(branch_id.to_string())
             .or_insert_with(|| AtomicU64::new(0))
-            .fetch_max(value, Ordering::SeqCst);
+            .fetch_max(value, Ordering::Relaxed);
     }
 
     fn is_loaded(&self, branch_id: &str) -> bool {
@@ -51,28 +62,26 @@ impl LsnCounters {
 
     fn next(&self, branch_id: &str) -> u64 {
         self.counters
-            .entry(branch_id.to_string())
-            .or_insert_with(|| AtomicU64::new(0))
-            .fetch_add(1, Ordering::SeqCst)
-            + 1 // fetch_add returns the old value, +1 gives us the new one
+            .get(branch_id)
+            .expect("next() called before counter was seeded via ensure_loaded()")
+            .fetch_add(1, Ordering::Relaxed)
+            + 1 // fetch_add returns the old value, +1 gives the new one
     }
 
     fn current(&self, branch_id: &str) -> u64 {
         self.counters
             .get(branch_id)
             .expect("current() called before counter was seeded via ensure_loaded()")
-            .load(Ordering::SeqCst)
+            .load(Ordering::Relaxed)
     }
 
-    /// Atomically reserve a block of `n` LSNs. Returns the first LSN in the block.
-    /// The caller owns [first, first + n - 1] exclusively
     /// TODO lowkey should take in a nonzero u64
     fn next_n(&self, branch_id: &str, n: u64) -> u64 {
         self.counters
-            .entry(branch_id.to_string())
-            .or_insert_with(|| AtomicU64::new(0))
-            .fetch_add(n, Ordering::SeqCst)
-            + 1 // fetch_add returns old value; first reserved LSN is old+1
+            .get(branch_id)
+            .expect("next_n() called before counter was seeded via ensure_loaded()")
+            .fetch_add(n, Ordering::Relaxed)
+            + 1 // fetch_add returns old value so first reserved LSN is old+1
     }
 }
 
