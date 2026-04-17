@@ -452,13 +452,11 @@ impl Engine {
             .await
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub async fn list_objects(
         &self,
         project: &str,
         branch_id: &str,
         prefix: Option<&str>,
-        delimiter: Option<&str>,
         cursor: Option<&str>,
         limit: usize,
         at_lsn: Option<u64>,
@@ -466,17 +464,15 @@ impl Engine {
         if let Some(prefix) = prefix {
             validate_no_nul("prefix", prefix)?;
         }
-        self.resolver
-            .resolve_object_listing(
-                project,
-                branch_id,
-                prefix,
-                delimiter,
-                cursor,
-                limit.max(1),
-                at_lsn,
-            )
-            .await
+        let page = self
+            .resolver
+            .resolve_listing(project, branch_id, prefix, cursor, limit.max(1), at_lsn)
+            .await?;
+        Ok(ObjectListResponse {
+            objects: page.items,
+            next_cursor: page.next_cursor,
+            has_more: page.has_more,
+        })
     }
 
     pub async fn create_snapshot(&self, project: &str, branch_id: &str) -> Result<SnapshotRecord> {

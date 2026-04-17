@@ -100,7 +100,6 @@ pub struct GetObjectResponse {
 #[derive(Serialize, Deserialize, Clone, Debug, ToSchema)]
 pub struct ObjectListResponse {
     pub objects: Vec<ObjectListEntry>,
-    pub common_prefixes: Vec<String>,
     pub next_cursor: Option<String>,
     pub has_more: bool,
 }

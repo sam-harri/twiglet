@@ -30,9 +30,6 @@ pub struct GetQuery {
 pub struct ListQuery {
     /// Filter to objects whose path starts with this prefix
     pub prefix: Option<String>,
-    /// Group objects by this delimiter (e.g. `/` for virtual directories).
-    /// Matching common prefixes are returned in `common_prefixes`.
-    pub delimiter: Option<String>,
     /// Opaque pagination cursor from a previous response
     pub cursor: Option<String>,
     /// Maximum number of objects to return (1–1000, default 100)
@@ -207,7 +204,6 @@ pub async fn list(
             &project_id,
             &branch_id,
             query.prefix.as_deref(),
-            query.delimiter.as_deref(),
             query.cursor.as_deref(),
             limit.max(1),
             query.at_lsn,

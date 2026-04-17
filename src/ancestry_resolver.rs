@@ -7,10 +7,10 @@
 //! Listing operations use a k-way merge. Each node in the ancestry chain is queried
 //! independently with a small batch size, and a min-heap merges them in sorted
 //! path order. Child nodes have higher priority (lower chain index) so they
-//! shadow parent versions and tombstones mask parent entries.
+//! shadow parent versions.
 
 use std::cmp::Reverse;
-use std::collections::{BTreeSet, BinaryHeap};
+use std::collections::BinaryHeap;
 use std::sync::Arc;
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
@@ -19,13 +19,20 @@ use crate::{
     error::{Error, Result},
     id::ProcessUniqueId,
     metastore::{MetadataStore, ObjectRecordEntry},
-    types::{ObjectListEntry, ObjectListResponse, Page, ResolvedObject},
+    types::{ObjectListEntry, Page, ResolvedObject},
 };
 
-/// Buffered stream of objects from a single node.
+/// Lazy cursor over one log segments's object records
+///
+/// The k-way merge can't load all records from all ancestor nodes upfront, so each
+/// node gets a `BranchStream`. It fetches one page at a time from the metastore and
+/// exposes a peek/advance interface so the merge loop can consume records one by one
+/// without holding more than `batch_size` records per ancestor in memory at once.
 struct BranchStream {
     node_id: ProcessUniqueId,
     max_lsn: u64,
+    /// Position in the ancestry chain (0 = leaf). Used to break ties when two
+    /// ancestors have a record at the same path (the lower number wins since its necessarily new).
     chain_index: usize,
     batch_size: usize,
     buffer: Vec<ObjectRecordEntry>,
@@ -44,8 +51,9 @@ impl BranchStream {
     }
 }
 
-/// Entry in the merge heap: sorted by (path, chain_index) so that for
-/// the same path the leaf node (chain_index 0) is popped first.
+/// Entry in the merge heap, sorted by (path, chain_index) so that for
+/// the same path the leaf node (lowest chain_index) is popped first,
+/// letting child writes shadow parent versions.
 #[derive(Eq, PartialEq)]
 struct MergeEntry {
     path: String,
@@ -73,7 +81,8 @@ impl AncestryResolver {
         Self { metadata }
     }
 
-    /// Returns `[(node_id, max_lsn)]` from leaf to root.
+    /// Returns `[(node_id, max_lsn)]` from leaf to root. Traverses the entire
+    /// tree so it's only used for list operations.
     ///
     /// For live queries `at_lsn` is `None` and the leaf max is `u64::MAX`,
     /// meaning all writes are visible. At each ancestor step the max LSN
@@ -85,7 +94,6 @@ impl AncestryResolver {
         branch_id: &str,
         at_lsn: Option<u64>,
     ) -> Result<Vec<(ProcessUniqueId, u64)>> {
-        // Resolve branch_id → leaf node via the handle.
         let (_, leaf) = self
             .metadata
             .get_branch(project, branch_id)
@@ -103,7 +111,7 @@ impl AncestryResolver {
             let fork_lsn = node
                 .fork_lsn
                 .expect("node has parent_node_id but no fork_lsn — integrity violation");
-            // Never query the parent past the fork point; smaller wins for time-travel.
+            // Don't query the parent past the fork point, and smaller wins for time-travel.
             max_lsn = max_lsn.min(fork_lsn);
             node = self
                 .metadata
@@ -122,6 +130,11 @@ impl AncestryResolver {
     }
 
     /// Walk the ancestry chain looking for the newest visible version of an object.
+    ///
+    /// Checks the leaf node first, then steps up to each ancestor, capping `max_lsn`
+    /// at the fork point each time so a parent is never queried past where the child
+    /// branched from it. Returns `None` if no version exists or the newest version
+    /// is a tombstone.
     pub async fn resolve_object(
         &self,
         project: &str,
@@ -129,7 +142,6 @@ impl AncestryResolver {
         path: &str,
         at_lsn: Option<u64>,
     ) -> Result<Option<ResolvedObject>> {
-        // Resolve branch_id → leaf node via the handle.
         let (_, leaf) = self
             .metadata
             .get_branch(project, branch_id)
@@ -173,7 +185,7 @@ impl AncestryResolver {
         }
     }
 
-    /// Fetch the next batch from a stream, returning true if new data is available.
+    /// Fetch the next batch into the stream's buffer, returns true if the buffer still has items.
     async fn refill_stream(
         &self,
         stream: &mut BranchStream,
@@ -222,7 +234,12 @@ impl AncestryResolver {
         Ok(())
     }
 
-    /// K-way merge of object records from all ancestors into a sorted, deduplicated page.
+    /// K-way merge across all ancestor nodes into a sorted, deduplicated page.
+    ///
+    /// All ancestor nodes are queried in parallel for their first batch, then a
+    /// min-heap drives the merge. For each path, the leaf version (lowest chain_index)
+    /// wins and all parent copies are dropped. Tombstones are filtered out of the
+    /// result but still consumed from the heap to mask parent versions.
     #[allow(clippy::too_many_arguments)]
     pub async fn resolve_listing(
         &self,
@@ -291,7 +308,7 @@ impl AncestryResolver {
             let path = entry.path;
             let idx = entry.chain_index;
 
-            let record = streams[idx].peek().unwrap().clone();
+            let record = streams[idx].peek().expect("heap invariant: stream has a record if it's in the heap").clone();
             streams[idx].advance();
             self.push_from_stream(&mut streams[idx], &mut heap, project, prefix)
                 .await?;
@@ -336,104 +353,5 @@ impl AncestryResolver {
         })
     }
 
-    /// List objects with optional S3-style delimiter support.
-    #[allow(clippy::too_many_arguments)]
-    pub async fn resolve_object_listing(
-        &self,
-        project: &str,
-        branch_id: &str,
-        prefix: Option<&str>,
-        delimiter: Option<&str>,
-        cursor: Option<&str>,
-        limit: usize,
-        at_lsn: Option<u64>,
-    ) -> Result<ObjectListResponse> {
-        let Some(delimiter) = delimiter else {
-            let page = self
-                .resolve_listing(project, branch_id, prefix, cursor, limit, at_lsn)
-                .await?;
-            return Ok(ObjectListResponse {
-                objects: page.items,
-                common_prefixes: Vec::new(),
-                next_cursor: page.next_cursor,
-                has_more: page.has_more,
-            });
-        };
-
-        enum Atom {
-            Object(ObjectListEntry),
-            Prefix(String),
-        }
-
-        let page = self
-            .resolve_listing(project, branch_id, prefix, None, usize::MAX, at_lsn)
-            .await?;
-
-        let prefix_filter = prefix.unwrap_or_default();
-        let mut prefixes = BTreeSet::new();
-        let mut atoms = Vec::new();
-
-        for item in page.items {
-            if let Some(suffix) = item.path.strip_prefix(prefix_filter)
-                && let Some(index) = suffix.find(delimiter)
-            {
-                let end = index + delimiter.len();
-                let common = format!("{}{}", prefix_filter, &suffix[..end]);
-                prefixes.insert(common);
-                continue;
-            }
-            atoms.push(Atom::Object(item));
-        }
-        atoms.extend(prefixes.into_iter().map(Atom::Prefix));
-        atoms.sort_by(|a, b| {
-            fn key(atom: &Atom) -> (&str, u8) {
-                match atom {
-                    Atom::Prefix(p) => (p.as_str(), 0),
-                    Atom::Object(o) => (o.path.as_str(), 1),
-                }
-            }
-            key(a).cmp(&key(b))
-        });
-
-        let cursor_key = |a: &Atom| match a {
-            Atom::Object(item) => format!("o:{}", item.path),
-            Atom::Prefix(p) => format!("p:{p}"),
-        };
-
-        let cursor_value = cursor
-            .map(|c| {
-                let raw = STANDARD.decode(c).map_err(|_| Error::InvalidCursor)?;
-                String::from_utf8(raw).map_err(|_| Error::InvalidCursor)
-            })
-            .transpose()?;
-        let start = if let Some(cursor_value) = cursor_value {
-            atoms
-                .iter()
-                .position(|atom| cursor_key(atom) == cursor_value)
-                .map(|idx| idx + 1)
-                .ok_or(Error::InvalidCursor)?
-        } else {
-            0
-        };
-        let end = (start + limit).min(atoms.len());
-
-        let mut objects = Vec::new();
-        let mut common_prefixes = Vec::new();
-        for atom in &atoms[start..end] {
-            match atom {
-                Atom::Object(item) => objects.push(item.clone()),
-                Atom::Prefix(prefix) => common_prefixes.push(prefix.clone()),
-            }
-        }
-
-        let has_more = end < atoms.len();
-        let next_cursor = has_more.then(|| STANDARD.encode(cursor_key(&atoms[end - 1]).as_bytes()));
-
-        Ok(ObjectListResponse {
-            objects,
-            common_prefixes,
-            next_cursor,
-            has_more,
-        })
-    }
 }
+
