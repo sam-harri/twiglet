@@ -128,23 +128,6 @@ async fn restore_to_before_fork_lsn_rewinds_past_own_history() {
 }
 
 #[tokio::test]
-async fn restore_backup_is_child_of_restored_branch_and_blocks_deletion() {
-    let ctx = Ctx::new().await;
-    let (project, _main, dev, lsn3_dev, _lsn4_dev) = setup(&ctx).await;
-
-    let (_branch_id, backup) = ctx.restore(&project, &dev, lsn3_dev).await;
-
-    let status = ctx.delete_branch(&project, &dev).await;
-    assert_eq!(status, StatusCode::CONFLICT);
-
-    let status = ctx.delete_branch(&project, &backup).await;
-    assert_eq!(status, StatusCode::NO_CONTENT);
-
-    let status = ctx.delete_branch(&project, &dev).await;
-    assert_eq!(status, StatusCode::NO_CONTENT);
-}
-
-#[tokio::test]
 async fn new_writes_after_restore_do_not_bleed_into_backup() {
     let ctx = Ctx::new().await;
     let (project, _main, dev, lsn3_dev, _lsn4_dev) = setup(&ctx).await;

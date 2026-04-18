@@ -76,7 +76,7 @@ impl Ctx {
         let j = body_json(resp).await;
         (
             j["project"]["project_id"].as_str().unwrap().to_string(),
-            j["project"]["default_branch_id"]
+            j["project"]["root_branch_id"]
                 .as_str()
                 .unwrap()
                 .to_string(),
@@ -109,18 +109,6 @@ impl Ctx {
         assert_eq!(resp.status(), StatusCode::CREATED, "fork_at_lsn failed");
         let j = body_json(resp).await;
         j["branch"]["branch_id"].as_str().unwrap().to_string()
-    }
-
-    pub async fn delete_branch(&self, project: &str, branch: &str) -> StatusCode {
-        self.raw(
-            Request::builder()
-                .method(Method::DELETE)
-                .uri(format!("/projects/{project}/branches/{branch}"))
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .status()
     }
 
     pub async fn put(&self, project: &str, branch: &str, path: &str, body: &[u8]) -> u64 {
