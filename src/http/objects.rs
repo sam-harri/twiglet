@@ -60,8 +60,7 @@ pub struct ListQuery {
         description = "Raw object content"
     ),
     responses(
-        (status = 201, description = "Object created", body = PutObjectResponse),
-        (status = 200, description = "Object overwritten", body = PutObjectResponse),
+        (status = 200, description = "Object stored", body = PutObjectResponse),
         (status = 404, description = "Project or branch not found", body = ErrorEnvelope),
     ),
     security(("basicAuth" = []))
@@ -71,7 +70,7 @@ pub async fn put(
     Path((project_id, branch_id, path)): Path<(String, String, String)>,
     headers: HeaderMap,
     body: Body,
-) -> Result<(StatusCode, Json<PutObjectResponse>)> {
+) -> Result<Json<PutObjectResponse>> {
     let content_type = headers
         .get(axum::http::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
@@ -84,12 +83,7 @@ pub async fn put(
         .put_object(&project_id, &branch_id, &path, &mut reader, content_type)
         .await?;
 
-    let status = if response.created {
-        StatusCode::CREATED
-    } else {
-        StatusCode::OK
-    };
-    Ok((status, Json(response)))
+    Ok(Json(response))
 }
 
 /// Download an object from a branch.

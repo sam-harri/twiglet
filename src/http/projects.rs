@@ -97,26 +97,3 @@ pub async fn get(
     let project = engine.get_project(&project_id).await?;
     Ok(Json(ProjectResponse { project }))
 }
-
-/// Delete a project (soft-delete).
-#[utoipa::path(
-    delete,
-    path = "/projects/{project_id}",
-    operation_id = "deleteProject",
-    tag = "projects",
-    params(
-        ("project_id" = String, Path, description = "Project ID")
-    ),
-    responses(
-        (status = 204, description = "Project deleted"),
-        (status = 404, description = "Project not found", body = ErrorEnvelope),
-    ),
-    security(("basicAuth" = []))
-)]
-pub async fn delete(
-    State(engine): State<Arc<Engine>>,
-    Path(project_id): Path<String>,
-) -> Result<StatusCode> {
-    engine.delete_project(&project_id).await?;
-    Ok(StatusCode::NO_CONTENT)
-}

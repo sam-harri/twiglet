@@ -31,16 +31,11 @@ pub fn router(engine: Arc<Engine>) -> Router {
         .route("/projects", post(projects::create))
         .route("/projects", get(projects::list))
         .route("/projects/{project_id}", get(projects::get))
-        .route("/projects/{project_id}", delete(projects::delete))
         .route("/projects/{project_id}/branches", post(branches::create))
         .route("/projects/{project_id}/branches", get(branches::list))
         .route(
             "/projects/{project_id}/branches/{branch_id}",
             get(branches::get),
-        )
-        .route(
-            "/projects/{project_id}/branches/{branch_id}",
-            delete(branches::delete),
         )
         .route(
             "/projects/{project_id}/branches/{branch_id}/fork",
@@ -69,10 +64,6 @@ pub fn router(engine: Arc<Engine>) -> Router {
         .route(
             "/projects/{project_id}/branches/{branch_id}/snapshots/{snapshot_name}",
             get(snapshots::get),
-        )
-        .route(
-            "/projects/{project_id}/branches/{branch_id}/snapshots/{snapshot_name}",
-            delete(snapshots::delete),
         )
         .route(
             "/projects/{project_id}/branches/{branch_id}/objects",

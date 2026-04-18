@@ -1,11 +1,17 @@
 //! Core engine that orchestrates all storage operations.
+//!
+//! Separation of concerns between the engine and metastore was something I hem and haw-ed
+//! about for a while. Here is the final decisions :
+//!
+//! "does this check need to be atomic with the storage mutation?"
+//! i.e., will the implementation differ with different KV backends (Postgres vs RockDB vs ...)
+//! If yes -> metastore, if no -> engine
 
 use std::{
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use dashmap::DashSet;
 use futures::{StreamExt, TryStreamExt};
 use tokio::io::AsyncRead;
 
@@ -24,48 +30,44 @@ use crate::{
 };
 
 pub struct Engine {
-    pub(crate) lsn: Arc<dyn LsnGenerator>,
-    pub(crate) chunker: Arc<dyn Chunker>,
-    pub(crate) chunks: Arc<dyn ChunkStore>,
-    pub(crate) metadata: Arc<dyn MetadataStore>,
-    pub(crate) resolver: Arc<AncestryResolver>,
-    /// Guards against concurrent merges from the same source branch.
-    /// Keyed by "project\0source_branch_id".
-    merge_locks: DashSet<String>,
+    lsn_generator: Arc<dyn LsnGenerator>,
+    chunker: Arc<dyn Chunker>,
+    chunk_store: Arc<dyn ChunkStore>,
+    metadata_store: Arc<dyn MetadataStore>,
+    ancestry_resolver: Arc<AncestryResolver>,
 }
 
 impl Engine {
     pub fn new(
-        lsn: Arc<dyn LsnGenerator>,
+        lsn_generator: Arc<dyn LsnGenerator>,
         chunker: Arc<dyn Chunker>,
-        chunks: Arc<dyn ChunkStore>,
-        metadata: Arc<dyn MetadataStore>,
-        resolver: Arc<AncestryResolver>,
+        chunk_store: Arc<dyn ChunkStore>,
+        metadata_store: Arc<dyn MetadataStore>,
+        ancestry_resolver: Arc<AncestryResolver>,
     ) -> Self {
         Self {
-            lsn,
+            lsn_generator,
             chunker,
-            chunks,
-            metadata,
-            resolver,
-            merge_locks: DashSet::new(),
+            chunk_store,
+            metadata_store,
+            ancestry_resolver,
         }
     }
 
     pub async fn create_project(&self) -> Result<Project> {
         let project_id = generate_project_id();
-        let default_branch_id = generate_branch_id();
+        let root_branch_id = generate_branch_id();
         let node_id = generate_node_id();
         let now = now_millis();
 
         let project = Project {
             project_id: project_id.clone(),
-            default_branch_id: default_branch_id.clone(),
+            root_branch_id: root_branch_id.clone(),
             created_at: now,
         };
 
         let root_handle = BranchHandle {
-            branch_id: default_branch_id.clone(),
+            branch_id: root_branch_id.clone(),
             node_id,
             parent_branch_id: None,
             created_at: now,
@@ -77,7 +79,7 @@ impl Engine {
             fork_lsn: None,
         };
 
-        self.metadata
+        self.metadata_store
             .create_project(&project, &root_handle, &root_node)
             .await?;
 
@@ -85,35 +87,33 @@ impl Engine {
     }
 
     pub async fn get_project(&self, project_id: &str) -> Result<Project> {
-        self.metadata
+        self.metadata_store
             .get_project(project_id)
             .await?
             .ok_or(Error::ProjectNotFound)
     }
 
-    pub async fn delete_project(&self, project_id: &str) -> Result<()> {
-        self.metadata.delete_project(project_id).await
-    }
-
     pub async fn list_projects(&self, cursor: Option<&str>, limit: usize) -> Result<Page<Project>> {
-        self.metadata.list_projects(cursor, limit.max(1)).await
+        self.metadata_store
+            .list_projects(cursor, limit.max(1))
+            .await
     }
 
     pub async fn create_branch(&self, project: &str, source_branch_id: &str) -> Result<BranchInfo> {
         self.get_project(project).await?;
 
-        // Resolve the source branch handle to get the source node_id.
         let (_, source_node) = self
-            .metadata
+            .metadata_store
             .get_branch(project, source_branch_id)
             .await?
             .ok_or(Error::BranchNotFound)?;
 
         let branch_id = generate_branch_id();
         let node_id = generate_node_id();
-        // Fork LSN is the current tip of the source branch's counter. The child
-        // counter seeds from this value, so its first write lands at fork_lsn + 1.
-        let fork_lsn = self.lsn.current(project, source_branch_id).await?;
+        let fork_lsn = self
+            .lsn_generator
+            .current(project, source_branch_id)
+            .await?;
         let now = now_millis();
 
         let new_handle = BranchHandle {
@@ -127,12 +127,10 @@ impl Engine {
             parent_node_id: Some(source_node.node_id),
             fork_lsn: Some(fork_lsn),
         };
-
-        self.metadata
-            .fork_branch(project, source_branch_id, &new_handle, &new_node)
+        self.metadata_store
+            .create_branch(project, &new_handle, &new_node)
             .await?;
 
-        // New branch starts at fork_lsn; no need for a round-trip to the store.
         Ok(branch_info_from_handle_and_node(
             new_handle, new_node, fork_lsn,
         ))
@@ -141,21 +139,12 @@ impl Engine {
     pub async fn get_branch(&self, project: &str, branch_id: &str) -> Result<BranchInfo> {
         self.get_project(project).await?;
         let (handle, node) = self
-            .metadata
+            .metadata_store
             .get_branch(project, branch_id)
             .await?
             .ok_or(Error::BranchNotFound)?;
-        let head_lsn = self.lsn.current(project, branch_id).await?;
+        let head_lsn = self.lsn_generator.current(project, branch_id).await?;
         Ok(branch_info_from_handle_and_node(handle, node, head_lsn))
-    }
-
-    pub async fn delete_branch(&self, project: &str, branch_id: &str) -> Result<()> {
-        let project_meta = self.get_project(project).await?;
-        if project_meta.default_branch_id == branch_id {
-            return Err(Error::CannotDeleteDefaultBranch);
-        }
-
-        self.metadata.delete_branch(project, branch_id).await
     }
 
     pub async fn list_branches(
@@ -166,14 +155,19 @@ impl Engine {
     ) -> Result<Page<BranchInfo>> {
         self.get_project(project).await?;
         let page = self
-            .metadata
+            .metadata_store
             .list_branches(project, cursor, limit.max(1))
             .await?;
-        let mut items = Vec::with_capacity(page.items.len());
-        for (handle, node) in page.items {
-            let head_lsn = self.lsn.current(project, &handle.branch_id).await?;
-            items.push(branch_info_from_handle_and_node(handle, node, head_lsn));
-        }
+        let items = futures::future::try_join_all(page.items.into_iter().map(
+            |(handle, node)| async move {
+                let head_lsn = self
+                    .lsn_generator
+                    .current(project, &handle.branch_id)
+                    .await?;
+                Ok::<_, Error>(branch_info_from_handle_and_node(handle, node, head_lsn))
+            },
+        ))
+        .await?;
         Ok(Page {
             items,
             next_cursor: page.next_cursor,
@@ -181,10 +175,6 @@ impl Engine {
         })
     }
 
-    /// Fork a new child branch from `branch_id` at `lsn`, returning the new branch.
-    ///
-    /// The source branch is left completely untouched. The new branch sees only
-    /// history up to `lsn` — writes to it advance from there.
     pub async fn fork_at_lsn(
         &self,
         project: &str,
@@ -193,12 +183,12 @@ impl Engine {
     ) -> Result<BranchInfo> {
         self.get_project(project).await?;
         let (source_handle, source_node) = self
-            .metadata
+            .metadata_store
             .get_branch(project, branch_id)
             .await?
             .ok_or(Error::BranchNotFound)?;
 
-        let branch_lsn = self.lsn.current(project, branch_id).await?;
+        let branch_lsn = self.lsn_generator.current(project, branch_id).await?;
         if lsn > branch_lsn {
             return Err(Error::InvalidRestoreLsn);
         }
@@ -219,7 +209,7 @@ impl Engine {
             fork_lsn: Some(lsn),
         };
 
-        self.metadata
+        self.metadata_store
             .create_branch(project, &new_handle, &new_node)
             .await?;
 
@@ -227,18 +217,15 @@ impl Engine {
         Ok(branch_info_from_handle_and_node(new_handle, new_node, lsn))
     }
 
-    /// Rewind `branch_id` in-place to `lsn`, atomically swapping its internal node.
+    /// Rewind `branch_id` in-place to `lsn`, atomically swapping its internal node
     ///
-    /// Before rewinding, a **backup branch** is created as a child of `branch_id`
+    /// Before rewinding, a backup branch is created as a child of `branch_id`
     /// pointing at its current node, so no history is lost. The same external
-    /// `branch_id` is preserved; future writes land on a fresh node that chains
+    /// `branch_id` is preserved and future writes land on a fresh node that chains
     /// back through the old node capped at `lsn`.
     ///
-    /// Returns `(restored_branch_info, backup_branch_info)`. The backup is a child
-    /// of `branch_id`, which prevents accidental deletion of `branch_id` until the
-    /// backup is explicitly removed.
-    ///
-    /// **Failure safety**: if the node swap fails after the backup is written, the
+    /// TODO make puts atomic as write group?
+    /// If the node swap fails after the backup is written, the
     /// original branch is untouched and only an orphaned backup exists.
     pub async fn restore(
         &self,
@@ -248,68 +235,69 @@ impl Engine {
     ) -> Result<(BranchInfo, BranchInfo)> {
         self.get_project(project).await?;
         let (handle, node) = self
-            .metadata
+            .metadata_store
             .get_branch(project, branch_id)
             .await?
             .ok_or(Error::BranchNotFound)?;
 
-        let branch_lsn = self.lsn.current(project, branch_id).await?;
+        let branch_lsn = self.lsn_generator.current(project, branch_id).await?;
         if lsn > branch_lsn {
             return Err(Error::InvalidRestoreLsn);
         }
 
         let now = now_millis();
 
-        // Step 1: Create a backup branch pointing at the current node so that the
-        // pre-restore state is never lost. Writing the same node record again is
-        // idempotent in RocksDB (same key, same value).
         let backup_handle = BranchHandle {
             branch_id: generate_branch_id(),
             node_id: node.node_id,
             parent_branch_id: Some(branch_id.to_string()),
             created_at: now,
         };
-        self.metadata
+        self.metadata_store
             .create_branch(project, &backup_handle, &node)
             .await?;
 
-        // Step 2: Create a fresh node chaining to the current node capped at `lsn`,
-        // then atomically swap the handle to point at it.
         let new_node = BranchNode {
             node_id: generate_node_id(),
             parent_node_id: Some(node.node_id),
             fork_lsn: Some(lsn),
         };
-        self.metadata
+        self.metadata_store
             .reset_branch_node(project, branch_id, &new_node)
             .await?;
 
-        let head_lsn = self.lsn.current(project, branch_id).await?;
-        let backup_head_lsn = self.lsn.current(project, &backup_handle.branch_id).await?;
+        let (head_lsn, backup_head_lsn) = futures::future::try_join(
+            self.lsn_generator.current(project, branch_id),
+            self.lsn_generator
+                .current(project, &backup_handle.branch_id),
+        )
+        .await?;
         let restored_info = branch_info_from_handle_and_node(handle, new_node, head_lsn);
         let backup_info = branch_info_from_handle_and_node(backup_handle, node, backup_head_lsn);
         Ok((restored_info, backup_info))
     }
 
-    /// Reset a branch by re-pointing it to a new node forked from its parent at
-    /// the current LSN. The same `branch_id` is preserved; old writes on the
-    /// branch become invisible (the node that held them is orphaned).
-    ///
-    /// Returns `Error::BranchIsRoot` if the branch has no parent.
+    /// Reparent `branch_id` in-place to its parent's current LSN.
+    /// Essentially create a new branch from my parent but keep my external branch id stable
     pub async fn reset_from_parent(&self, project: &str, branch_id: &str) -> Result<BranchInfo> {
         self.get_project(project).await?;
         let (handle, node) = self
-            .metadata
+            .metadata_store
             .get_branch(project, branch_id)
             .await?
             .ok_or(Error::BranchNotFound)?;
 
-        let parent_node_id = node.parent_node_id.ok_or(Error::BranchIsRoot)?;
         let parent_branch_id = handle
             .parent_branch_id
             .as_deref()
             .ok_or(Error::BranchIsRoot)?;
-        let fork_lsn = self.lsn.current(project, parent_branch_id).await?;
+        let parent_node_id = node
+            .parent_node_id
+            .expect("parent_branch_id and parent_node_id are always set together");
+        let fork_lsn = self
+            .lsn_generator
+            .current(project, parent_branch_id)
+            .await?;
 
         let new_node = BranchNode {
             node_id: generate_node_id(),
@@ -317,11 +305,11 @@ impl Engine {
             fork_lsn: Some(fork_lsn),
         };
 
-        self.metadata
+        self.metadata_store
             .reset_branch_node(project, branch_id, &new_node)
             .await?;
 
-        let head_lsn = self.lsn.current(project, branch_id).await?;
+        let head_lsn = self.lsn_generator.current(project, branch_id).await?;
         Ok(branch_info_from_handle_and_node(handle, new_node, head_lsn))
     }
 
@@ -335,19 +323,14 @@ impl Engine {
     ) -> Result<PutObjectResponse> {
         validate_no_nul("path", path)?;
         let (_, node) = self
-            .metadata
+            .metadata_store
             .get_branch(project, branch_id)
             .await?
             .ok_or(Error::BranchNotFound)?;
         let node_id = node.node_id;
 
-        // Check existence before chunking so we can return 200 vs 201.
-        let existing = self
-            .metadata
-            .get_object(project, node_id, path, None)
-            .await?;
-        let created = existing.is_none_or(|(_, meta)| meta.tombstone);
-
+        // TODO not sure what a correct value for this would be
+        // Need to do some more looking around
         const UPLOAD_CONCURRENCY: usize = 256;
 
         let chunk_stream = self.chunker.chunk(&mut stream);
@@ -357,7 +340,7 @@ impl Engine {
 
         let mut uploads = chunk_stream
             .map_ok(|chunk| {
-                let store = self.chunks.clone();
+                let store = self.chunk_store.clone();
                 async move {
                     store.put(&chunk.hash, chunk.data).await?;
                     Ok((chunk.hash, chunk.length))
@@ -370,7 +353,7 @@ impl Engine {
             chunk_hashes.push(hash);
         }
 
-        let lsn = self.lsn.next(project, branch_id).await?;
+        let lsn = self.lsn_generator.next(project, branch_id).await?;
 
         let meta = ObjectMeta {
             chunks: chunk_hashes,
@@ -380,11 +363,11 @@ impl Engine {
             created_at: now_millis(),
         };
 
-        self.metadata
+        self.metadata_store
             .put_object(project, node_id, path, lsn, &meta)
             .await?;
 
-        Ok(PutObjectResponse { lsn, size, created })
+        Ok(PutObjectResponse { lsn, size })
     }
 
     pub async fn get_object(
@@ -396,7 +379,7 @@ impl Engine {
     ) -> Result<Option<GetObjectResponse>> {
         validate_no_nul("path", path)?;
         let Some(resolved) = self
-            .resolver
+            .ancestry_resolver
             .resolve_object(project, branch_id, path, at_lsn)
             .await?
         else {
@@ -404,7 +387,7 @@ impl Engine {
         };
 
         let hashes = resolved.meta.chunks.clone();
-        let chunks = Arc::clone(&self.chunks);
+        let chunks = Arc::clone(&self.chunk_store);
         let stream = futures::stream::iter(hashes).then(move |hash| {
             let chunks = Arc::clone(&chunks);
             async move { chunks.get(&hash).await }
@@ -419,22 +402,22 @@ impl Engine {
     pub async fn delete_object(&self, project: &str, branch_id: &str, path: &str) -> Result<()> {
         validate_no_nul("path", path)?;
         let (_, node) = self
-            .metadata
+            .metadata_store
             .get_branch(project, branch_id)
             .await?
             .ok_or(Error::BranchNotFound)?;
         let node_id = node.node_id;
-        let lsn = self.lsn.next(project, branch_id).await?;
+        let lsn = self.lsn_generator.next(project, branch_id).await?;
 
         let tombstone = ObjectMeta {
             chunks: Vec::new(),
             size: 0,
-            content_type: "application/octet-stream".to_string(),
+            content_type: String::new(),
             tombstone: true,
             created_at: now_millis(),
         };
 
-        self.metadata
+        self.metadata_store
             .put_object(project, node_id, path, lsn, &tombstone)
             .await
     }
@@ -447,7 +430,7 @@ impl Engine {
         at_lsn: Option<u64>,
     ) -> Result<Option<ResolvedObject>> {
         validate_no_nul("path", path)?;
-        self.resolver
+        self.ancestry_resolver
             .resolve_object(project, branch_id, path, at_lsn)
             .await
     }
@@ -465,7 +448,7 @@ impl Engine {
             validate_no_nul("prefix", prefix)?;
         }
         let page = self
-            .resolver
+            .ancestry_resolver
             .resolve_listing(project, branch_id, prefix, cursor, limit.max(1), at_lsn)
             .await?;
         Ok(ObjectListResponse {
@@ -477,12 +460,12 @@ impl Engine {
 
     pub async fn create_snapshot(&self, project: &str, branch_id: &str) -> Result<SnapshotRecord> {
         self.get_project(project).await?;
-        self.metadata
+        self.metadata_store
             .get_branch(project, branch_id)
             .await?
             .ok_or(Error::BranchNotFound)?;
 
-        let snapshot_lsn = self.lsn.current(project, branch_id).await?;
+        let snapshot_lsn = self.lsn_generator.current(project, branch_id).await?;
 
         let snapshot = SnapshotRecord {
             snapshot_id: generate_snapshot_id(),
@@ -491,7 +474,7 @@ impl Engine {
             created_at: now_millis(),
         };
 
-        self.metadata
+        self.metadata_store
             .create_snapshot(project, branch_id, &snapshot)
             .await?;
 
@@ -505,7 +488,11 @@ impl Engine {
         name: &str,
     ) -> Result<SnapshotRecord> {
         self.get_project(project).await?;
-        self.metadata
+        self.metadata_store
+            .get_branch(project, branch_id)
+            .await?
+            .ok_or(Error::BranchNotFound)?;
+        self.metadata_store
             .get_snapshot(project, branch_id, name)
             .await?
             .ok_or(Error::SnapshotNotFound)
@@ -519,62 +506,37 @@ impl Engine {
         limit: usize,
     ) -> Result<Page<SnapshotRecord>> {
         self.get_project(project).await?;
-        self.metadata
+        self.metadata_store
+            .get_branch(project, branch_id)
+            .await?
+            .ok_or(Error::BranchNotFound)?;
+        self.metadata_store
             .list_snapshots(project, branch_id, cursor, limit.max(1))
             .await
     }
 
-    pub async fn delete_snapshot(&self, project: &str, branch_id: &str, name: &str) -> Result<()> {
+    /// Play all the post fork mutations of `source_branch_id` onto its parent by reserving however many
+    /// mutations worth of LSNs as a contiguous chunk and moving over the metadata records
+    ///
+    /// TODO look into O(1) merge op using a metadata record that routes the parent through the child first
+    /// Read overhead, not sure if its worth it
+    pub async fn merge(&self, project: &str, source_branch_id: &str) -> Result<(BranchInfo, u64)> {
         self.get_project(project).await?;
-        self.metadata
-            .delete_snapshot(project, branch_id, name)
-            .await
-    }
-
-    /// Replay all of `source_branch_id`'s direct-layer writes (from its fork
-    /// point up to the current LSN) onto `target_branch_id`.
-    ///
-    /// Constraints (validated before the merge proceeds):
-    /// - Source and target must be different branches.
-    /// - Source must be a **direct child** of target
-    ///   (`source.parent_branch_id == Some(target_branch_id)`).
-    /// - Source must have **no children** of its own (leaf branch only).
-    ///
-    /// After a successful merge, target's node contains all object versions that
-    /// source wrote since it was forked. Source is left untouched and may be
-    /// deleted by the caller once no longer needed.
-    ///
-    /// Returns the updated `BranchInfo` for target and the number of object
-    /// records that were copied.
-    pub async fn merge(
-        &self,
-        project: &str,
-        source_branch_id: &str,
-        target_branch_id: &str,
-    ) -> Result<(BranchInfo, u64)> {
-        self.get_project(project).await?;
-
-        if source_branch_id == target_branch_id {
-            return Err(Error::InvalidInput(
-                "cannot merge a branch into itself".to_string(),
-            ));
-        }
 
         let (source_handle, source_node) = self
-            .metadata
+            .metadata_store
             .get_branch(project, source_branch_id)
             .await?
             .ok_or(Error::BranchNotFound)?;
 
-        // Source must be a direct child of target.
-        if source_handle.parent_branch_id.as_deref() != Some(target_branch_id) {
-            return Err(Error::NotDirectChild);
-        }
+        // Source must have a parent — root branches can't be merged.
+        let target_branch_id = source_handle
+            .parent_branch_id
+            .as_deref()
+            .ok_or(Error::BranchIsRoot)?;
 
-        // Source must have no children — merging non-leaf branches would leave
-        // grandchildren dangling at a stale fork point.
         if !self
-            .metadata
+            .metadata_store
             .list_children(project, source_branch_id)
             .await?
             .is_empty()
@@ -583,78 +545,74 @@ impl Engine {
         }
 
         let (target_handle, target_node) = self
-            .metadata
+            .metadata_store
             .get_branch(project, target_branch_id)
             .await?
             .ok_or(Error::BranchNotFound)?;
 
-        // Acquire a per-source merge lock to prevent concurrent merges from the
-        // same child racing each other. The lock is an entry in an in-process
-        // DashSet; it is held across the async scan so it cannot be a
-        // MutationLease (which borrows the metastore's DashSet and cannot cross
-        // await points).
-        let lock_key = format!("{project}\0{source_branch_id}");
-        if !self.merge_locks.insert(lock_key.clone()) {
-            return Err(Error::Conflict);
-        }
+        let source_head_lsn = self
+            .lsn_generator
+            .current(project, source_branch_id)
+            .await?;
 
-        let result: Result<(BranchInfo, u64)> = async {
-            // Snapshot the source branch's LSN so we get a consistent picture of
-            // its direct layer even if other writes land while we scan.
-            let source_head_lsn = self.lsn.current(project, source_branch_id).await?;
-
-            // Collect all direct-layer objects from source up to source_head_lsn.
-            // Memory is O(N × object_meta_size); acceptable for V1.
-            let mut all_objects: Vec<ObjectRecordEntry> = Vec::new();
-            let mut start_after: Option<String> = None;
-            loop {
-                let page = self
-                    .metadata
-                    .list_objects(
-                        project,
-                        source_node.node_id,
-                        None,
-                        Some(source_head_lsn),
-                        start_after.as_deref(),
-                        500,
-                    )
-                    .await?;
-                all_objects.extend(page.items);
-                if !page.has_more {
-                    break;
-                }
-                start_after = page.next_cursor;
-            }
-
-            let n = all_objects.len() as u64;
-            if n == 0 {
-                let head_lsn = self.lsn.current(project, target_branch_id).await?;
-                return Ok((
-                    branch_info_from_handle_and_node(target_handle, target_node, head_lsn),
-                    0,
-                ));
-            }
-
-            // Reserve a contiguous block of LSNs on the target branch.
-            let base_lsn = self.lsn.next_n(project, target_branch_id, n).await?;
-
-            // Write all objects atomically onto target via a single WriteBatch.
-            self.metadata
-                .bulk_put_objects(project, target_node.node_id, base_lsn, all_objects)
+        // Collect all direct-layer objects from source up to source_head_lsn.
+        // Memory is O(N * object_meta_size), acceptable for now.
+        let mut all_objects: Vec<ObjectRecordEntry> = Vec::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let page = self
+                .metadata_store
+                .list_objects(
+                    project,
+                    source_node.node_id,
+                    None,
+                    Some(source_head_lsn),
+                    cursor.as_deref(),
+                    500,
+                )
                 .await?;
-
-            let head_lsn = self.lsn.current(project, target_branch_id).await?;
-            Ok((
-                branch_info_from_handle_and_node(target_handle, target_node, head_lsn),
-                n,
-            ))
+            all_objects.extend(page.items);
+            if !page.has_more {
+                break;
+            }
+            cursor = page.next_cursor;
         }
-        .await;
 
-        // Always release the lock, regardless of success or failure.
-        self.merge_locks.remove(&lock_key);
+        let n = all_objects.len() as u64;
+        if n == 0 {
+            let head_lsn = self
+                .lsn_generator
+                .current(project, target_branch_id)
+                .await?;
+            return Ok((
+                branch_info_from_handle_and_node(target_handle, target_node, head_lsn),
+                0,
+            ));
+        }
 
-        result
+        let base_lsn = self
+            .lsn_generator
+            .next_n(project, target_branch_id, n)
+            .await?;
+
+        self.metadata_store
+            .merge_objects(
+                project,
+                source_branch_id,
+                target_node.node_id,
+                base_lsn,
+                all_objects,
+            )
+            .await?;
+
+        let head_lsn = self
+            .lsn_generator
+            .current(project, target_branch_id)
+            .await?;
+        Ok((
+            branch_info_from_handle_and_node(target_handle, target_node, head_lsn),
+            n,
+        ))
     }
 }
 
@@ -665,9 +623,6 @@ fn branch_info_from_handle_and_node(
 ) -> BranchInfo {
     BranchInfo {
         branch_id: handle.branch_id,
-        // Only expose fork_lsn when there is a parent; root branches that happen to
-        // point at a node with fork_lsn set (e.g. after an internal swap) should not
-        // leak internal tree structure through the API.
         fork_lsn: if handle.parent_branch_id.is_some() {
             node.fork_lsn
         } else {
@@ -680,7 +635,7 @@ fn branch_info_from_handle_and_node(
 }
 
 fn validate_no_nul(field: &str, value: &str) -> Result<()> {
-    if value.as_bytes().contains(&0) {
+    if value.contains('\0') {
         return Err(Error::InvalidInput(format!(
             "{field} contains unsupported null byte"
         )));

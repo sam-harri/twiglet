@@ -73,7 +73,7 @@ pub struct SnapshotRecord {
 #[derive(Serialize, Deserialize, Clone, Debug, ToSchema)]
 pub struct Project {
     pub project_id: String,
-    pub default_branch_id: String,
+    pub root_branch_id: String,
     pub created_at: i64,
 }
 
@@ -89,7 +89,6 @@ pub struct Page<T> {
 pub struct PutObjectResponse {
     pub lsn: u64,
     pub size: u64,
-    pub created: bool,
 }
 
 pub struct GetObjectResponse {

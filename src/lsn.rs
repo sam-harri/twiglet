@@ -1,13 +1,14 @@
 //! Per-branch LSN generators.
 //!
 //! Each branch has its own atomic counter seeded from its parent's `fork_lsn` at
-//! creation time. 
+//! creation time.
 //!
 //! Because child counters are seeded from the parent's current LSN at fork time , all
 //! possible ancestry traversals are strictly monotonically decreasing from head to root
 //!
 //! On the first access for a branch, `LazyAtomicLsnGenerator` gets the current node, then finds the highest LSN
 //! already written on that node.
+//!
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};

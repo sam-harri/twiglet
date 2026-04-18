@@ -1,6 +1,6 @@
 //! Resolves objects across branch ancestry.
 //!
-//! Basically try to resolve the read in your own branch history, if you cant,
+//! Try to resolve the read in your own branch history, if you cant,
 //! go up to your parent and resolve the read between their own creation time and the time at
 //! which you forked. Keep going up ancestry until you hit or return NotFound
 //!
@@ -251,15 +251,11 @@ impl AncestryResolver {
         at_lsn: Option<u64>,
     ) -> Result<Page<ObjectListEntry>> {
         let chain = self.ancestry_chain(project, branch_id, at_lsn).await?;
-        let start_after = cursor
-            .map(|c| {
-                let raw = STANDARD.decode(c).map_err(|_| Error::InvalidCursor)?;
-                String::from_utf8(raw).map_err(|_| Error::InvalidCursor)
-            })
-            .transpose()?;
-
         let batch_size = limit.clamp(64, 4096);
 
+        // The external cursor is the same opaque token that `list_objects` produces
+        // (base64 path bytes). It applies uniformly to all ancestor nodes so each
+        // stream starts scanning from the same path boundary.
         let initial_pages =
             futures::future::try_join_all(chain.iter().map(|(node_id, max_lsn)| {
                 self.metadata.list_objects(
@@ -267,7 +263,7 @@ impl AncestryResolver {
                     *node_id,
                     prefix,
                     Some(*max_lsn),
-                    start_after.as_deref(),
+                    cursor,
                     batch_size,
                 )
             }))
@@ -308,7 +304,10 @@ impl AncestryResolver {
             let path = entry.path;
             let idx = entry.chain_index;
 
-            let record = streams[idx].peek().expect("heap invariant: stream has a record if it's in the heap").clone();
+            let record = streams[idx]
+                .peek()
+                .expect("heap invariant: stream has a record if it's in the heap")
+                .clone();
             streams[idx].advance();
             self.push_from_stream(&mut streams[idx], &mut heap, project, prefix)
                 .await?;
@@ -352,6 +351,4 @@ impl AncestryResolver {
             has_more,
         })
     }
-
 }
-

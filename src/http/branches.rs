@@ -151,34 +151,6 @@ pub async fn get(
     Ok(Json(BranchResponse { branch }))
 }
 
-/// Delete a branch.
-///
-/// The default branch cannot be deleted. A branch with child branches cannot
-/// be deleted until all children are removed.
-#[utoipa::path(
-    delete,
-    path = "/projects/{project_id}/branches/{branch_id}",
-    operation_id = "deleteBranch",
-    tag = "branches",
-    params(
-        ("project_id" = String, Path, description = "Project ID"),
-        ("branch_id" = String, Path, description = "Branch ID"),
-    ),
-    responses(
-        (status = 204, description = "Branch deleted"),
-        (status = 404, description = "Project or branch not found", body = ErrorEnvelope),
-        (status = 409, description = "Branch has children or is the default branch", body = ErrorEnvelope),
-    ),
-    security(("basicAuth" = []))
-)]
-pub async fn delete(
-    State(engine): State<Arc<Engine>>,
-    Path((project_id, branch_id)): Path<(String, String)>,
-) -> Result<StatusCode> {
-    engine.delete_branch(&project_id, &branch_id).await?;
-    Ok(StatusCode::NO_CONTENT)
-}
-
 /// Reset a branch to its parent's current state.
 ///
 /// Creates a new internal node forked from the branch's parent at the current
@@ -209,13 +181,6 @@ pub async fn reset_from_parent(
     Ok(Json(BranchResponse { branch }))
 }
 
-/// Request body for merging a source branch into its parent target branch.
-#[derive(Deserialize, ToSchema)]
-pub struct MergeRequest {
-    /// ID of the target (parent) branch to merge into
-    pub target_branch_id: String,
-}
-
 /// Response returned after a successful merge.
 #[derive(Serialize, ToSchema)]
 pub struct MergeResponse {
@@ -228,12 +193,14 @@ pub struct MergeResponse {
 /// Merge a source branch into its direct parent.
 ///
 /// Replays all object writes that `source_branch_id` made since it was forked
-/// onto `target_branch_id`. The source branch must be a **direct child** of the
-/// target and must have **no children** of its own. After a successful merge,
-/// the source branch is unchanged and may be deleted by the caller.
+/// Merge a source branch into its direct parent.
+///
+/// Replays all object writes that `branch_id` made since it was forked onto its
+/// parent branch. The source must have no children of its own. After a successful
+/// merge the source branch is unchanged.
 ///
 /// All copies are applied atomically (all-or-nothing). Tombstones are
-/// propagated, so deletes on the source branch will take effect on the target.
+/// propagated, so deletes on the source branch will take effect on the parent.
 #[utoipa::path(
     post,
     path = "/projects/{project_id}/branches/{branch_id}/merge",
@@ -243,23 +210,19 @@ pub struct MergeResponse {
         ("project_id" = String, Path, description = "Project ID"),
         ("branch_id" = String, Path, description = "Source branch ID to merge from"),
     ),
-    request_body = MergeRequest,
     responses(
         (status = 200, description = "Merge successful", body = MergeResponse),
         (status = 404, description = "Project or branch not found", body = ErrorEnvelope),
         (status = 409, description = "Source has children or a concurrent merge is in progress", body = ErrorEnvelope),
-        (status = 422, description = "Source is not a direct child of target", body = ErrorEnvelope),
+        (status = 422, description = "Source branch has no parent", body = ErrorEnvelope),
     ),
     security(("basicAuth" = []))
 )]
 pub async fn merge(
     State(engine): State<Arc<Engine>>,
     Path((project_id, source_branch_id)): Path<(String, String)>,
-    Json(req): Json<MergeRequest>,
 ) -> Result<Json<MergeResponse>> {
-    let (branch, objects_merged) = engine
-        .merge(&project_id, &source_branch_id, &req.target_branch_id)
-        .await?;
+    let (branch, objects_merged) = engine.merge(&project_id, &source_branch_id).await?;
     Ok(Json(MergeResponse {
         branch,
         objects_merged,

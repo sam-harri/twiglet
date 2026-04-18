@@ -120,30 +120,3 @@ pub async fn get(
         .await?;
     Ok(Json(SnapshotResponse { snapshot }))
 }
-
-/// Delete a snapshot.
-#[utoipa::path(
-    delete,
-    path = "/projects/{project_id}/branches/{branch_id}/snapshots/{snapshot_name}",
-    operation_id = "deleteSnapshot",
-    tag = "snapshots",
-    params(
-        ("project_id" = String, Path, description = "Project ID"),
-        ("branch_id" = String, Path, description = "Branch ID"),
-        ("snapshot_name" = String, Path, description = "Snapshot ID"),
-    ),
-    responses(
-        (status = 204, description = "Snapshot deleted"),
-        (status = 404, description = "Project, branch, or snapshot not found", body = ErrorEnvelope),
-    ),
-    security(("basicAuth" = []))
-)]
-pub async fn delete(
-    State(engine): State<Arc<Engine>>,
-    Path((project_id, branch_id, snapshot_name)): Path<(String, String, String)>,
-) -> Result<StatusCode> {
-    engine
-        .delete_snapshot(&project_id, &branch_id, &snapshot_name)
-        .await?;
-    Ok(StatusCode::NO_CONTENT)
-}

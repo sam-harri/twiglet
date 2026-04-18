@@ -20,12 +20,8 @@ pub enum Error {
     ObjectNotFound,
     #[error("Snapshot not found")]
     SnapshotNotFound,
-    #[error("Source branch is not a direct child of target")]
-    NotDirectChild,
     #[error("Branch has children")]
     BranchHasChildren,
-    #[error("Cannot delete the default branch")]
-    CannotDeleteDefaultBranch,
     #[error("Branch has no parent (is the root branch)")]
     BranchIsRoot,
     #[error("Branch mutation already in progress")]
@@ -64,11 +60,10 @@ impl Error {
             | Self::BranchNotFound
             | Self::ObjectNotFound
             | Self::SnapshotNotFound => StatusCode::NOT_FOUND,
-            Self::ProjectAlreadyExists
-            | Self::BranchHasChildren
-            | Self::CannotDeleteDefaultBranch
-            | Self::Conflict => StatusCode::CONFLICT,
-            Self::NotDirectChild | Self::BranchIsRoot => StatusCode::UNPROCESSABLE_ENTITY,
+            Self::ProjectAlreadyExists | Self::BranchHasChildren | Self::Conflict => {
+                StatusCode::CONFLICT
+            }
+            Self::BranchIsRoot => StatusCode::UNPROCESSABLE_ENTITY,
             Self::InvalidCursor | Self::InvalidInput(_) | Self::InvalidRestoreLsn => {
                 StatusCode::BAD_REQUEST
             }
@@ -86,10 +81,8 @@ impl Error {
 
             Self::ObjectNotFound => "OBJECT_NOT_FOUND",
             Self::SnapshotNotFound => "SNAPSHOT_NOT_FOUND",
-            Self::NotDirectChild => "NOT_DIRECT_CHILD",
             Self::BranchIsRoot => "BRANCH_IS_ROOT",
             Self::BranchHasChildren => "BRANCH_HAS_CHILDREN",
-            Self::CannotDeleteDefaultBranch => "CANNOT_DELETE_DEFAULT_BRANCH",
             Self::Conflict => "CONFLICT",
             Self::InvalidCursor => "INVALID_CURSOR",
             Self::InvalidInput(_) => "INVALID_INPUT",
