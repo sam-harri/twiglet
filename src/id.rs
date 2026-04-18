@@ -8,7 +8,6 @@ use rand::RngExt;
 use rand::distr::Alphanumeric;
 pub use snowflake::ProcessUniqueId;
 
-pub type BranchId = String;
 
 const TREE_ADJECTIVES: &[&str] = &[
     "ancient",

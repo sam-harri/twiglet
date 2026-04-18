@@ -29,7 +29,7 @@ pub struct ObjectRecordEntry {
 
 impl From<ObjectRecordEntry> for ObjectMeta {
     fn from(e: ObjectRecordEntry) -> Self {
-        ObjectMeta {
+        Self {
             chunks: e.chunks,
             size: e.size,
             content_type: e.content_type,
